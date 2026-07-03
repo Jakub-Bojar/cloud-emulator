@@ -21,6 +21,18 @@ IPERF_PORT_COUNT = int(os.environ.get("IPERF_PORT_COUNT", "8"))
 # Back-compat alias; some callers still want a single canonical port.
 IPERF_PORT = IPERF_BASE_PORT
 
+# UDP datagram size for the iperf3 net generator (the `-l` flag). iperf3's small
+# default (~1460 B) means thousands of sendmsg() calls/sec at higher rates, and
+# that PER-CALL cost — not the byte volume — is what dominates a net-heavy pod's
+# CPU. Larger datagrams carry the same Mbps in far fewer calls, so this cuts the
+# CPU "floor" that otherwise makes actual CPU overshoot a low target. The kernel
+# IP-fragments anything over the MTU, so the wire still carries MTU-sized packets
+# and any link shaping is unaffected — only the userspace syscall count drops.
+# Kept under the 65507-byte UDP payload max. Set to "" or "0" to fall back to
+# iperf3's default. TCP is unaffected (its default block size is already large).
+# Tunable without a rebuild via the env in worker-template.yaml.
+IPERF_UDP_LEN = os.environ.get("IPERF_UDP_LEN", "32K").strip()
+
 # --- iperf3 server-pool self-recycling -------------------------------------
 # An iperf3 server (`-s -p PORT`) hosts ONE session at a time. If the client
 # of a session dies uncleanly (SIGKILL during a reconfigure, a pod eviction,

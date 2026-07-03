@@ -69,8 +69,8 @@ PEER_EGRESS = Gauge("worker_peer_egress_mbps",
 PEER_RTT = Gauge("worker_peer_rtt_ms",
                  "TCP-handshake round-trip time to a peer pod (ms), probed "
                  "against the peer's HTTP port every 15s. Measured pod-to-pod, "
-                 "so it includes injected inter-tier latency (Chaos Mesh / tc "
-                 "netem). One series per peer IP this pod sends to.",
+                 "so it reflects the real network path between the pods. One "
+                 "series per peer IP this pod sends to.",
                  ["peer"])
 
 

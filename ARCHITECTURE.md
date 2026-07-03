@@ -1,6 +1,6 @@
 # Architecture Diagrams
 
-Six diagrams that cover the system at progressively finer grain. Each
+Seven diagrams that cover the system at progressively finer grain. Each
 is provided in both Mermaid (rendered by GitHub, Notion, most IDEs) and
 ASCII (paste-anywhere fallback).
 
@@ -10,6 +10,7 @@ ASCII (paste-anywhere fallback).
 4. [x propagation](#4-x-propagation) — how the input signal cascades through roles
 5. [Two-phase materialisation](#5-two-phase-materialisation) — why deploys take two passes
 6. [Site API & federation roadmap](#6-site-api--federation-roadmap) — one VM today, a fleet tomorrow
+7. [Site placement & network shaping](#7-site-placement--network-shaping) — `node_site_mapping`, `placements`, and `network_links`
 
 ---
 
@@ -131,7 +132,7 @@ sequenceDiagram
     participant K8s as Kubernetes API
     participant Pod as Worker Pod(s)
 
-    User->>Ctrl: POST /template {name, x, roles, edges}
+    User->>Ctrl: POST /template {name, x, apps, edges}
     Ctrl->>Mat: validate(template)
     Note over Mat: Schema check<br/>+ cycle detection
     Mat-->>Ctrl: ok (or 400 ValueError)
@@ -231,7 +232,7 @@ flowchart TB
     subgraph pod["Worker Pod"]
         subgraph entry["worker.py (entry point)"]
             HTTP["HTTP Server :8080<br/>/health · /status · /metrics"]
-            Configure["configure(payload)<br/>━━━━━━━━━━━━━━━<br/>1. stop current<br/>2. start net<br/>3. measure baseline<br/>4. start CPU & RAM"]
+            Configure["configure(payload)<br/>━━━━━━━━━━━━━━━<br/>1. stop current<br/>2. start net<br/>3. seed CPU at raw target<br/>(no baseline measured)<br/>4. RAM starts unallocated"]
         end
 
         subgraph loads["loads.py"]
@@ -294,8 +295,8 @@ flowchart TB
    │   │ configure(payload)                                     │     │
    │   │   1. stop running loads                                │     │
    │   │   2. start network (servers + clients)                 │     │
-   │   │   3. sample baseline (1s window)                       │     │
-   │   │   4. start CPU + RAM sized for target − baseline       │     │
+   │   │   3. seed CPU at the raw target — no baseline measured │     │
+   │   │   4. RAM starts unallocated (nudger sizes it later)    │     │
    │   └─┬───────────────┬──────────────┬─────────────┬─────────┘     │
    │     ▼               ▼              ▼             ▼               │
    │  ┌──────┐      ┌──────┐      ┌─────────┐    ┌─────────┐          │
@@ -601,11 +602,121 @@ flowchart TB
 | Federation gateway (fan-out + merge) | Planned |
 | Cross-site topology edges (traffic between VMs) | Planned |
 
+> **Two unrelated "site" concepts, same word.** This section's `site` block
+> (`SITE_ID`/`SITE_TIER`) identifies *which controller/VM* answered — for a
+> future federation gateway spanning multiple controllers. §7 below covers a
+> template's `node_site_mapping` "site" names, which identify *nodes within
+> one cluster* for pod placement and `network_links` shaping. Same word,
+> different layer — don't confuse the two.
+
+---
+
+## 7. Site placement & network shaping
+
+How a template's `placements` and `network_links` become real pod placement
+and real `tc` shaping — the mechanism behind "brownfield" deployment onto
+nodes you name yourself, no Kubernetes node labelling required.
+
+### Mermaid
+
+```mermaid
+flowchart TB
+    Tmpl["<b>Template JSON</b><br/>node_site_mapping: [{k8s_node, site_name}]<br/>apps.*.placements: [{site/sites, count}]<br/>network_links: [{from, to, rtt_ms, bandwidth_mbps}]"]
+
+    subgraph Mat["Materialiser — validate() + _placement_targets()"]
+        SiteMap["site_to_node = {site_name: k8s_node}<br/>(from node_site_mapping)"]
+        Resolve["Resolve each placements entry's<br/>site/sites through site_to_node"]
+        NS["nodeSelector: {kubernetes.io/hostname: &lt;node&gt;}<br/>— same mechanism as placement.node"]
+        SiteMap --> Resolve --> NS
+    end
+
+    subgraph K8s["Kubernetes API"]
+        DepA["Deployment (app A)"]
+        DepB["Deployment (app B)"]
+    end
+
+    NodeA[("Node<br/>site-A")]
+    NodeB[("Node<br/>site-B")]
+
+    subgraph Netem["netem.py — apply(template)"]
+        NResolve["_resolve_sites(node_site_mapping)<br/>→ {site_name: (node_name, InternalIP)}"]
+        TC["tc htb + netem, one script per node,<br/>via `multipass exec &lt;node&gt;`<br/>— rtt_ms/2 one-way delay + bandwidth cap"]
+        NResolve --> TC
+    end
+
+    Tmpl --> SiteMap
+    Tmpl --> NResolve
+    NS --> DepA
+    NS --> DepB
+    DepA -->|nodeSelector match| NodeA
+    DepB -->|nodeSelector match| NodeB
+    TC -.->|shapes NIC toward peer IP| NodeA
+    TC -.->|shapes NIC toward peer IP| NodeB
+```
+
+### ASCII
+
+```
+   Template JSON
+   ┌────────────────────────────────────────────────────────────┐
+   │ node_site_mapping: [{k8s_node, site_name}, ...]             │
+   │ apps.<app>.placements: [{site|sites, count}, ...]           │
+   │ network_links: [{from, to, rtt_ms, bandwidth_mbps?}, ...]   │
+   └───────────────┬──────────────────────────┬─────────────────┘
+                   │                          │
+                   ▼                          ▼
+   ┌───────────────────────────┐   ┌────────────────────────────┐
+   │ materialiser.py           │   │ netem.py                   │
+   │  site_to_node =           │   │  _resolve_sites() looks up │
+   │   {site_name: k8s_node}   │   │  each mapped node's live   │
+   │  _placement_targets()     │   │  InternalIP via the k8s    │
+   │  resolves each             │   │  API (needs the nodes      │
+   │  placements entry's        │   │  ClusterRole — namespaced  │
+   │  site/sites through it    │   │  Roles can't grant it)     │
+   │  → nodeSelector            │   └──────────────┬─────────────┘
+   │   {kubernetes.io/hostname:│                  │
+   │    <node>}                │                  ▼
+   └──────────────┬─────────────┘   ┌────────────────────────────┐
+                  │                 │ tc htb + netem, ONE script  │
+                  ▼                 │ per node (all its links),   │
+   ┌───────────────────────────┐    │ applied via                 │
+   │ Deployment(s) per app      │    │ `multipass exec <node>`     │
+   │ (one per site for `sites`) │    │ — rtt_ms/2 one-way delay,   │
+   └──────────────┬─────────────┘    │ bandwidth_mbps rate cap      │
+                  │ nodeSelector      └──────────────┬─────────────┘
+                  ▼ match                            │ shapes NIC
+        ┌──────────────────┐                         ▼ toward peer IP
+        │  Node: site-A     │◀───────────────────────┘
+        │  Node: site-B     │◀────────────────────────
+        └──────────────────┘
+```
+
+### Key points
+
+- **No node labelling.** `node_site_mapping` is the template's own registry —
+  `placements` and `network_links` reference logical site names, resolved to
+  real k8s node names entirely inside the template. The legacy `placement`
+  (singular) form still exists for raw label/hostname placement without a
+  mapping.
+- **Same pinning mechanism as `placement.node`.** A resolved `placements`
+  entry becomes a `nodeSelector: {kubernetes.io/hostname: <node>}` — no new
+  Kubernetes concept, just automated lookup.
+- **Validated at POST time.** Every site name in `placements`/`network_links`
+  must resolve through `node_site_mapping` — a typo or missing entry is a
+  `400`, not pods silently stuck `Pending`.
+- **`netem.py`'s `multipass exec` needs the controller to actually reach the
+  Multipass host.** This works when the controller runs as a plain process on
+  the Multipass host; the shipped containerized deployment
+  (`manifests/controller.yaml`, a Pod inside the cluster) has no path to the
+  host's Multipass hypervisor, so shaping silently no-ops there even though
+  pod placement (the materialiser half) works regardless — see RUNBOOK.md's
+  "Known limitations".
+
 ---
 
 ## Diagram-to-section index
 
-For a presentation, you don't need all five at once. Suggested pairings:
+For a presentation, you don't need all seven at once. Suggested pairings:
 
 | Slide topic | Use diagram |
 |-------------|-------------|
@@ -615,6 +726,7 @@ For a presentation, you don't need all five at once. Suggested pairings:
 | "What's clever about the model?" | §4 x propagation |
 | "How are deploys resilient?" | §5 Two-phase materialisation |
 | "How does this scale to many VMs?" | §6 Site API & federation roadmap |
+| "How do I place pods on real nodes and shape links?" | §7 Site placement & network shaping |
 
 The strongest single-slide story is **§1 + §4 side by side**: §1 shows
 the parts, §4 shows the model that ties them together.

@@ -15,8 +15,14 @@ diagnostics, Prometheus scraping, and direct `kubectl port-forward`.
 
 Examples use `192.168.2.2:30081` for the controller (replace with your
 MicroK8s host IP) and `localhost:8080` for the worker (after a
-`kubectl port-forward`). Placeholders like `<role>` refer to whatever
-role name you're working with.
+`kubectl port-forward`). Placeholders like `<app>` refer to whatever
+app name you're working with.
+
+> **Apps vs. roles.** A template describes a topology of **apps**. Each app
+> materialises into one Kubernetes "role" — the `role=` pod label and the
+> `wt-<name>-<app>` resource names — so the **observability** responses
+> (`/overview`, `/measurements/*`, `/graph`) still group their results under a
+> `roles` key, keyed by app name.
 
 ## One controller, one template
 
@@ -24,7 +30,7 @@ A controller manages **exactly one template** — the topology for its
 site/VM. The template routes are therefore **singular and take no name**
 (`/template`, not `/templates/<name>`). The template's `name` field still
 exists internally because every Kubernetes resource is named
-`wt-<name>-<role>`. POSTing a second, differently-named template while one
+`wt-<name>-<app>`. POSTing a second, differently-named template while one
 is materialised returns `409`; re-POSTing the same name re-materialises
 idempotently.
 
@@ -46,10 +52,13 @@ The controller serves three groups of endpoints:
 ## `POST /template`
 
 Materialise the topology. Validates the template (shape, cycle detection
-on the role graph, latency durations), computes the resolved `x` for each
-role via topological propagation, and creates one Deployment + ConfigMap +
-Service per role. After the pods come up it resolves peer IPs (Phase 2) and
-reconciles any inter-tier latency (Phase 3).
+on the app graph, `placements`/`node_site_mapping`/`network_links`
+cross-references), computes the resolved `x` for each app via topological
+propagation, and creates one Deployment + ConfigMap + Service per app. After
+the pods come up it resolves peer IPs and writes them back (Phase 2). If the
+template declares `network_links`, the controller also applies `tc netem`/`htb`
+shaping on each site's node NIC (`controller/netem.py`) — this is the one part
+of materialisation that isn't pure Kubernetes API calls; see TEMPLATE.md.
 
 Idempotent for the **same** `name`: re-POSTing updates the existing
 resources via PATCH (use it as a "reapply" if you lose track of state). For
@@ -59,67 +68,96 @@ surgical changes prefer `PATCH /template`.
 
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
-| `name` | string | yes | k8s name (lowercase + digits + `-`). Becomes the resource prefix `wt-<name>-<role>` |
-| `x` | number | yes | The signal that drives the topology. Sources use it directly; downstream roles use the resolved cascade |
-| `roles` | object | yes | Map of `role_name → role_spec`. See below |
-| `edges` | array | optional | List of `{"from": role, "to": role}` |
-| `latency` | object | optional | Inter-tier one-way latency, applied as `tc` shaping on the tier nodes. See "Inter-tier latency" below |
+| `name` | string | yes | k8s name (lowercase + digits + `-`). Becomes the resource prefix `wt-<name>-<app>` |
+| `x` | number **or** `{app: number}` map | yes | The signal that drives the topology. A number seeds every source app; a map seeds each named source app independently (downstream apps always derive their x). See "x propagation" |
+| `apps` | object | yes | Map of `app_name → app_spec`. See below |
+| `edges` | array | optional | App-to-app links: list of `{"from": app, "to": app}` |
+| `node_site_mapping` | array | optional | Site name → k8s node registry: `[{"k8s_node", "site_name"}, ...]`. Used by `placements` and `network_links` |
+| `network_links` | array | optional | Declared latency/bandwidth between sites: `[{"from", "to", "rtt_ms", "bandwidth_mbps"?}, ...]`, applied via `tc netem` |
+| `runtime_scenarios` | array | optional | Time-varying load schedule for the scenario runner. See "Scenario runner" below |
 
-**Role spec:**
+This is a **brownfield** API: you already own a cluster with nodes; a template
+describes the **workload** and **where its pods run on your nodes**. Full field
+reference (including `placements`/`node_site_mapping`/`network_links`) is in
+[TEMPLATE.md](TEMPLATE.md).
+
+**App spec:**
 
 ```json
 {
-  "count": 2,
-  "tier": "edge",
-  "node": "site-edge-01-1",
   "cpu": {"a": 0, "b": 100},
   "ram": {"a": 0, "b": 128},
-  "net": {"a": 0.2, "b": 0}
+  "net": {"a": 0.2, "b": 0},
+  "placements": [ { "site": "site-A", "count": 3 } ]
 }
 ```
 
-Targets are computed per pod as `value = a * x_role + b`, where `x_role` is
-the resolved x for that role (see "x propagation" below). `tier` is optional
-and pins the role's pods to nodes labelled `tier=<value>` (e.g.
-edge / fog / cloud); absent = schedule anywhere.
+Targets are computed per pod as `value = a * x_app + b` (see "x propagation").
+`count` is required unless `placements` is used (then it's derived from the
+sum of placement entry counts). Where the pods actually run is decided by
+**exactly one** of `placement` (object) or `placements` (array) — both are
+**enforced**, not advisory:
 
-`node` is optional and pins the role's pods to **one specific node** by name
-(its `kubernetes.io/hostname`, which equals the node/VM name) via
-`nodeSelector: {kubernetes.io/hostname: <node>}`. If combined with `tier` the
-node must belong to that tier, else the pods stay `Pending`. All replicas of a
-node-pinned role co-locate on that node. Change it live to **move** a
-deployment — `PATCH {"roles.<role>.node": "site-edge-01-1"}` reschedules onto
-that node; `PATCH {"roles.<role>.node": ""}` unpins it back to tier-level
-placement. In the topology schema, set it per deployment as
-`k8s_app_description[].node_name`.
+- **`placement`** (legacy, raw node labels/hostnames) — one of:
+  - **`{ "on": { <label>: <value>, ... }, "spread"?: true }`** — schedule the
+    app's `count` pods on nodes matching these labels (`nodeSelector`); `spread`
+    distributes them evenly across the matches (`topologySpreadConstraints`).
+    Use the labels your nodes already carry (`kubectl get nodes --show-labels`).
+  - **`{ "node": "<hostname>" }`** — pin all the app's pods to that one node.
+  - **`{ "nodes": [ { "node": "<hostname>", "count": N }, ... ] }`** — run N pods
+    on each named node. The controller materialises **one Deployment per node**
+    (all sharing the app's Service). The counts must **sum to `count`**.
+- **`placements`** (array, site names resolved through the template's
+  `node_site_mapping` — no node labelling needed) — a list of:
+  - **`{ "site": "<site_name>", "count": N }`** — N pods pinned to that site's
+    node.
+  - **`{ "sites": ["<site_name>", ...], "count": N }`** — N pods at **each**
+    listed site (one Deployment per site).
 
-**Inter-tier latency:**
+  Every site named must appear in the template's `node_site_mapping` — a `400`
+  otherwise, not a silently `Pending` pod.
+
+Omit both to fall back to the controller's **`DEFAULT_NODE`** env
+(`manifests/controller.yaml`), or schedule anywhere if that's unset —
+`DEFAULT_NODE` also overrides `placements`' site resolution entirely, handy
+for single-node testing without editing the template.
+
+Validation (`400`): `placement` and `placements` are mutually exclusive; within
+`placement`, only one mode at a time, `spread` only with `on`, `on` a
+non-empty label map, `node` a non-empty hostname, `nodes` counts positive ints
+summing to `count` with no node repeated; within `placements`, every
+`site`/`sites` name must resolve via `node_site_mapping`. Pods referencing a
+label/host no node has stay `Pending` (standard Kubernetes) — this can only
+happen with `placement`, since `placements` is validated against
+`node_site_mapping` at POST time.
+
+**Scenario runner (`runtime_scenarios`):**
 
 ```json
-"latency": {
-  "edge": { "fog": "30ms", "cloud": "120ms" },
-  "fog":  { "cloud": "60ms" }
-}
+"runtime_scenarios": [
+  { "phase_id": "warmup", "start_min": 0,  "end_min": 5,  "x": 10 },
+  { "phase_id": "peak",   "start_min": 5,  "end_min": 15, "x": { "ingest-a": 80, "ingest-b": 20 } },
+  { "phase_id": "cooldown","start_min": 15, "end_min": 25, "x": 20 }
+]
 ```
 
-Each value is the **one-way latency** you want between pods of the two
-tiers — `"edge": {"fog": "30ms"}` means a packet takes 30ms edge→fog (and
-30ms fog→edge, since latency is symmetric). The controller applies it as
-**link-level `tc` shaping on the nodes** (`controller/netem.py`): an `htb`
-class + `netem` delay on each tier node's NIC, matched on the **peer tier's
-node IP**, injecting the **full** value on each direction (so a round trip is
-~2× it). Because the rule lives on the inter-node link, pods inherit it
-automatically — scaling a tier never disturbs it. Reconciled on every
-materialise and removed on DELETE. Pairs are symmetric — give each once, in
-either orientation. Durations accept `us` / `ms` / `s`; same-tier pairs,
-duplicate pairs, and values above 10s are rejected with a 400. Requires the
-controller to run on the host with `multipass` access to the nodes (no Chaos
-Mesh needed). Retune live with a dot-path PATCH: `{"latency.edge.fog":
-"50ms"}`. The measured one-way value is visible per link as
-`worker_peer_rtt_ms / 2` (the TCP round-trip halved) in the Latency section
-of `grafana/grafana-network.json`, next to the configured
-`emulator_configured_one_way_ms`; measured throughput per link is in that
-dashboard's Bandwidth section (`worker_peer_egress_mbps`).
+A template may carry a `runtime_scenarios` list to drive a **time-varying
+load** instead of a fixed `x`. Each phase is a wall-clock window (minutes
+since the template was POSTed) holding the input `x` at a value; `x` takes the
+**same two forms as the top-level `x`** — a single number for every source app,
+or an `{app: number}` map for per-source starting values — and downstream apps
+re-derive their own `x` from it (the same x-propagation model as a static
+template). The controller runs one scenario runner at a time: it steps `x` to
+the active phase on a 5s clock by re-resolving and re-patching every app's
+ConfigMap, and workers hot-reload each change within ~2s — no pod restart. A
+phase's `x` **replaces** the previous phase's wholesale (a map phase fully
+defines that window's starting points; sources it omits run at 0 for that
+window). After the last phase it holds that phase's `x`. Editing the schedule
+with a PATCH restarts the clock from now; a DELETE (or a PATCH that removes
+`runtime_scenarios`) stops it. The runner is in-memory, so a controller restart
+resumes it from the start of the schedule. Phases need numeric `start_min` /
+`end_min` and a valid `x` with `end_min > start_min`; a bad schedule (including
+an `x` map that names a non-source app) is rejected with a 400.
 
 **Example:**
 
@@ -129,15 +167,41 @@ curl -X POST http://192.168.2.2:30081/template \
   -d @templates/iot-pipeline.json
 ```
 
-**Response (201):**
+**Response (201):** a materialisation summary — plus the controller-**derived**
+values you can't read off the template: each app's **`resolved_x`** (its
+propagated cascade value), the **`deployments`** it materialises into
+(`replicas` + `node_selector` each, so a `nodes`/`placements` split and the
+`DEFAULT_NODE` fallback are both visible), and its resolved **`peers`**.
+`node_site_mapping` echoes back as the resolved `{site_name: k8s_node}` map (or
+`null` if the template declared none); `network_links` as a count (or `null`)
+— same lightweight-indicator pattern as `runtime_scenarios`, since the full
+declared content round-trips via `GET /template`.
+
 ```json
 {
   "timestamp": "2026-06-12T14:00:00+01:00",
   "name": "<name>",
-  "roles": ["<source-role>", "<sink-role>"],
+  "x": 10,                              // as posted: a number or {app: number} map
+  "default_node": "microk8s-vm",        // the controller's DEFAULT_NODE (or null)
+  "runtime_scenarios": 4,               // number of phases (or null if none)
+  "node_site_mapping": { "site-A": "edge-1", "site-B": "edge-2" },  // resolved map, or null
+  "network_links": 2,                   // number of declared links, or null
+  "apps": {
+    "ingest": {
+      "count": 3,
+      "placement": null,
+      "placements": [ { "site": "site-A", "count": 2 }, { "site": "site-B", "count": 1 } ],
+      "deployments": [
+        { "replicas": 2, "node_selector": { "kubernetes.io/hostname": "edge-1" } },
+        { "replicas": 1, "node_selector": { "kubernetes.io/hostname": "edge-2" } }
+      ],
+      "resolved_x": 10.0                // the x this app's formulas evaluate at
+    },
+    "store": { "...": "..." }
+  },
   "peers": {
-    "<source-role>": ["wt-<name>-<sink-role>"],
-    "<sink-role>": []
+    "ingest": ["wt-<name>-store"],
+    "store": []
   }
 }
 ```
@@ -147,7 +211,7 @@ curl -X POST http://192.168.2.2:30081/template \
 | Code | Meaning |
 |------|---------|
 | 201 | Materialised |
-| 400 | Invalid JSON, validation failure, cycle in the role graph, or bad latency |
+| 400 | Invalid JSON, validation failure, cycle in the app graph, bad `placement`/`placements`, or a `network_links`/`placements` site name with no matching `node_site_mapping` entry |
 | 409 | A *different* template is already materialised — PATCH or DELETE it first |
 | 502 | A k8s API call failed mid-materialisation. Partial resources may exist — re-POST or DELETE to clean up |
 
@@ -169,45 +233,60 @@ cleanly — the controller strips the injected `timestamp` on the way in.)
 Apply a partial update. Deep-merges the patch body into the existing
 template, re-runs validation (including cycle detection), and
 re-materialises. Workers pick up the new ConfigMap within ~60s (kubelet
-sync) — **no pod restart** unless the change adds/removes pods.
+sync) — **no pod restart** unless the change adds/removes pods. A patch that
+changes `network_links` re-applies `tc netem`/`htb` shaping immediately
+(`materialise()` calls `netem.apply()` unconditionally on every
+materialisation, including PATCH-triggered ones).
 
 **Merge semantics:**
 
-- Dicts merge recursively. `{"roles": {"<role>": {"net": {"a": 0.3}}}}`
-  changes only that role's `net.a`.
+- Dicts merge recursively. `{"apps": {"<app>": {"net": {"a": 0.3}}}}`
+  changes only that app's `net.a`.
 - Scalars and lists in the patch **replace** the existing value. To change
-  one edge, send the whole new `edges` list. (`latency` is an object, so a
-  single pair merges in place.)
+  one edge, send the whole new `edges` list. `network_links` and
+  `node_site_mapping` are lists too, so to retune a link send the whole
+  `network_links` list.
 - **Dot-path shorthand**: a flat key with dots expands to nested JSON, e.g.
-  `{"latency.edge.cloud": "150ms"}` ≡ `{"latency": {"edge": {"cloud": "150ms"}}}`.
+  `{"apps.web.cpu.a": 5}` ≡ `{"apps": {"web": {"cpu": {"a": 5}}}}`. (Dot-path
+  reaches into objects only, not list elements — patch `network_links` whole.)
 - The `name` and any injected `timestamp` in the body are ignored.
 
 **Common patches:**
 
 ```bash
-# Change x — the whole topology recascades
+# Change x for every source — the whole topology recascades
 curl -X PATCH http://192.168.2.2:30081/template -d '{"x": 20}'
 
-# Bump one role's network — downstream x values re-resolve
-curl -X PATCH http://192.168.2.2:30081/template -d '{"roles.web.net.a": 0.30}'
+# Bump one source app's starting x (map merges: other sources unchanged)
+curl -X PATCH http://192.168.2.2:30081/template -d '{"x": {"ingest-b": 90}}'
 
-# Scale a role (adds/removes pods; re-resolves x + re-wires peers)
-curl -X PATCH http://192.168.2.2:30081/template -d '{"roles.api.count": 4}'
+# Bump one app's network — downstream x values re-resolve
+curl -X PATCH http://192.168.2.2:30081/template -d '{"apps.web.net.a": 0.30}'
 
-# Retune an inter-tier latency live
-curl -X PATCH http://192.168.2.2:30081/template -d '{"latency.edge.cloud": "150ms"}'
+# Scale an app (adds/removes pods; re-resolves x + re-wires peers)
+curl -X PATCH http://192.168.2.2:30081/template -d '{"apps.api.count": 4}'
+
+# Re-place an app (send the whole placement object — replaces the old one)
+curl -X PATCH http://192.168.2.2:30081/template \
+  -d '{"apps": {"web": {"placement": {"on": {"tier": "fog"}}}}}'
+
+# Retune a declared link's latency/bandwidth (send the whole network_links list)
+curl -X PATCH http://192.168.2.2:30081/template \
+  -d '{"network_links": [{"from": "site-A", "to": "site-B", "rtt_ms": 50}]}'
 ```
 
 **Response (200):** `{"timestamp", "name", "template": {…merged…}, "peers": {…}}`
 
-**Status codes:** `200` patched · `400` validation/cycle/bad latency ·
+**Status codes:** `200` patched · `400` validation/cycle/bad placement ·
 `404` no template materialised · `502` k8s failure.
 
 ## `DELETE /template`
 
-Tear down every resource for the materialised template. Inter-tier link
-shaping (`tc` on the tier nodes) is removed first, along with any leftover
-Chaos Mesh `NetworkChaos`, then Deployments, Services, and ConfigMaps.
+Tear down every resource for the materialised template: Deployments,
+Services, and ConfigMaps. If the template declared `network_links`, this also
+clears the `tc netem`/`htb` shaping rules from every site's node NIC
+(`controller/netem.py`) — the one piece of cleanup that isn't a Kubernetes
+API delete.
 
 ```bash
 curl -X DELETE http://192.168.2.2:30081/template
@@ -243,18 +322,26 @@ via env (`manifests/controller.yaml`; default `"local"` / `"unknown"`). The
 block lets a future federation gateway fan out to many controllers and merge
 responses by site with no schema change.
 
+> **Two unrelated "site" concepts, same word.** This `site` block identifies
+> *which controller/VM* answered — for a future multi-controller federation
+> gateway. It's unrelated to a template's `node_site_mapping` "site" names
+> (see TEMPLATE.md), which identify *nodes within one cluster* for pod
+> placement and `network_links` shaping. Don't confuse the two.
+
 ### Timezone
 
 Timestamps in responses (and naive request timestamps to
 `/measurements/*`) use the controller's local timezone, set via the `TZ`
-env var (default `Europe/London`). Internals compute in absolute unix time,
-so this is presentation only; rendered values carry their UTC offset so
-they stay unambiguous.
+env var — `manifests/controller.yaml` ships it set to `Europe/London`; the
+code itself falls back to `UTC` if `TZ` is unset or unrecognised (logged as a
+warning). Internals compute in absolute unix time, so this is presentation
+only; rendered values carry their UTC offset so they stay unambiguous.
 
 ## `GET /overview`
 
-Site-wide snapshot — every materialised template with per-role desired vs
-ready replica counts and a pod-health rollup. **Subsumes the old `/health`
+Site-wide snapshot — every materialised template with per-app desired vs
+ready replica counts (under a `roles` key, keyed by app name) and a
+pod-health rollup. **Subsumes the old `/health`
 endpoint**: the `"ok": true` field is present whenever the web layer is up
 (the k8s readiness probe itself is now a cheap TCP-socket check, not an HTTP
 hit on this heavier endpoint).
@@ -272,7 +359,7 @@ curl http://192.168.2.2:30081/overview | python3 -m json.tool
   "namespace": "cloud-native-emulator",
   "templates": [
     {"name": "<name>", "source": "http",
-     "roles": {"<role>": {"desired": 2, "ready": 2}},
+     "roles": {"<app>": {"desired": 2, "ready": 2}},
      "pods": {"total": 3, "ready": 3}}
   ],
   "prometheus": {"available": true, "url": "http://…:9090"}
@@ -281,10 +368,11 @@ curl http://192.168.2.2:30081/overview | python3 -m json.tool
 
 ## `GET /measurements/now`
 
-Rich, instantaneous per-role status. For each role: desired/ready replicas,
-the resolved `x`, role-level target and actual sums (CPU/RAM/NET), and a
-per-pod list fusing k8s state with that pod's current worker gauges. Also
-returns measured role→role edge traffic. Live scrapes only — no Prometheus.
+Rich, instantaneous per-app status (under a `roles` key, keyed by app name).
+For each app: desired/ready replicas, the resolved `x`, app-level target and
+actual sums (CPU/RAM/NET), and a per-pod list fusing k8s state with that pod's
+current worker gauges. Also returns measured app→app edge traffic. Live
+scrapes only — no Prometheus.
 
 Pods that exist in k8s but aren't in Endpoints yet (starting up, not Ready)
 are surfaced with an empty `metrics: {}`, so an in-progress scale-up is
@@ -300,18 +388,19 @@ curl http://192.168.2.2:30081/measurements/now | python3 -m json.tool
   "timestamp": "2026-06-12T14:00:00+01:00",
   "site": {"id": "local", "tier": "cloud"},
   "name": "<name>",
+  "source": "http",
   "roles": {
-    "<role>": {
+    "<app>": {
       "desired": 2, "ready": 2, "x": 10.0,
       "targets": {"cpu_millicores": 100.0, "ram_mb": 128.0, "net_mbps": 4.0},
       "actuals": {"cpu_millicores": 98.2, "ram_mb": 130.1, "net_mbps": 3.9},
-      "pods": [{"name": "wt-<name>-<role>-abc123", "ip": "10.1.0.42",
+      "pods": [{"name": "wt-<name>-<app>-abc123", "ip": "10.1.0.42",
                 "node": "node-1", "phase": "Running", "ready": true,
                 "restarts": 0, "age_seconds": 312,
                 "metrics": {"x": 10.0, "target_cpu_millicores": 50.0, "...": "..."}}]
     }
   },
-  "edges": [{"from": "<role-a>", "to": "<role-b>", "mbps": 3.912}],
+  "edges": [{"from": "<app-a>", "to": "<app-b>", "mbps": 3.912}],
   "prometheus": {"available": null}
 }
 ```
@@ -323,7 +412,8 @@ curl http://192.168.2.2:30081/measurements/now | python3 -m json.tool
 CPU/RAM/network for the template, **aggregated between two points in
 time** — the "just tell me the numbers" endpoint. Returns scalars: the
 template-wide target and actual summed across pods then reduced over the
-interval, **always** broken down by role and accompanied by an `x` block.
+interval, **always** broken down by app (under a `roles` key) and accompanied
+by an `x` block.
 
 **Query params:**
 
@@ -334,10 +424,10 @@ interval, **always** broken down by role and accompanied by an `x` block.
 | `resources` | `cpu,ram,net` | Comma-separated subset. Unknown values → 400 |
 
 `totals` carries `target_avg`, `actual_avg`, `actual_min`, `actual_max`;
-the per-role breakdown carries the two averages. The `x` block is split by
-provenance: **`input`** (source roles, whose x *is* the template's x) and
-**`derived`** (downstream roles, x propagated from upstream egress). Both
-are averaged — not summed — across each role's pods.
+the per-app breakdown carries the two averages. The `x` block is split by
+provenance: **`input`** (source apps, whose x *is* the template's x) and
+**`derived`** (downstream apps, x propagated from upstream egress). Both
+are averaged — not summed — across each app's pods.
 
 ```bash
 # Last 15 minutes (defaults)
@@ -359,9 +449,9 @@ curl -s "http://192.168.2.2:30081/measurements/range?start=2026-06-10T11:00:00&e
   "window": "3600s",
   "totals": {"cpu_millicores": {"target_avg": 980.0, "actual_avg": 951.2,
                                 "actual_min": 902.0, "actual_max": 1010.5}, "...": "..."},
-  "roles":  {"<role>": {"cpu_millicores": {"target_avg": 484.8, "actual_avg": 470.1}, "...": "..."}},
-  "x": {"input":   {"<source>": 40.0},
-        "derived": {"<downstream>": 31.5}},
+  "roles":  {"<app>": {"cpu_millicores": {"target_avg": 484.8, "actual_avg": 470.1}, "...": "..."}},
+  "x": {"input":   {"<source-app>": 40.0},
+        "derived": {"<downstream-app>": 31.5}},
   "prometheus": {"available": true, "url": "http://…:9090"}
 }
 ```
@@ -421,7 +511,7 @@ template — the data source behind `grafana/grafana-nodegraph.json`. **No
 
 | Param | Default | Notes |
 |-------|---------|-------|
-| `view` | `role` | `role`: one node per role, stats summed across its pods, edges role→role. `pods`: one node per pod, raw pod→pod edges |
+| `view` | `role` | `role` (default): one node per app, stats summed across its pods, edges app→app. `pods`: one node per pod, raw pod→pod edges |
 
 ```bash
 curl http://192.168.2.2:30081/graph | python3 -m json.tool
@@ -430,35 +520,59 @@ curl "http://192.168.2.2:30081/graph?view=pods" | python3 -m json.tool
 
 `404` if nothing is materialised.
 
+## `GET /metrics` (controller)
+
+Prometheus text-format scrape endpoint on the **controller** itself — distinct
+from each worker pod's own `/metrics` (below). Publishes the materialised
+template's *declared* `network_links` values, recomputed from the live
+template on every scrape (so a PATCH retune shows up at once):
+
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `emulator_configured_rtt_ms` | `pair` (`"site-A ↔ site-B"`) | Declared round-trip latency per site pair |
+| `emulator_configured_bandwidth_mbps` | `pair` | Declared per-direction bandwidth cap per site pair (only pairs that declared one) |
+
+Compare these against the workers' *measured* `worker_peer_rtt_ms` /
+`worker_peer_egress_mbps` to see how the real `tc netem`-shaped path compares
+to what the template declares. Cleared (no series) when nothing is
+materialised or the template has no `network_links`. Scraped by the
+`emulator-controller` PodMonitor in `manifests/monitoring.yaml`.
+
+```bash
+curl -s http://192.168.2.2:30081/metrics | grep -E "^emulator_"
+```
+
 ---
 
 ## x propagation — the model behind the template
 
-The template's `x` is a *signal* that flows through the role graph, not a
-global constant shared by every role.
+The template's `x` is a *signal* that flows through the app graph, not a
+global constant shared by every app.
 
 ```
-template.x   ──▶  source roles (no inbound edges)
-                  │
+x (scalar or {app: n})  ──▶  each source app (no inbound edges)
+                  │           starts at its own seed value
                   │ NET formula:  per_pod_egress = max(0, net.a * x + net.b)
-                  │ role total:   count * per_pod_egress
+                  │ app total:    count * per_pod_egress
                   ▼
-                  downstream role's x = Σ (upstream role totals)
-                  │ same formula again with this role's net coefficients
+                  downstream app's x = Σ (upstream app totals)
+                  │ same formula again with this app's net coefficients
                   ▼
                   …
 ```
 
-For each role, the controller computes `x_role` via a topological pass
-(Kahn's algorithm). A source role's x is `template.x`; a downstream role's x
-is the sum of upstream role-total egress. All three of CPU, RAM, and NET
-formulas evaluate at this resolved x. The `/measurements/range` and
-`/periods` responses split these into `x.input` (sources) and `x.derived`
-(downstream).
+For each app, the controller computes `x_app` via a topological pass
+(Kahn's algorithm). A source app's x is its seed — the single `x` number, or
+its own entry in the `{app: number}` map (unlisted sources default to 0); a
+downstream app's x is the sum of upstream app-total egress. All three of CPU,
+RAM, and NET formulas evaluate at this resolved x. The `/measurements/range`
+and `/periods` responses split these into `x.input` (sources — where per-source
+starting values appear) and `x.derived` (downstream). This is what lets one
+template run several independent sub-systems (DAGs) from different starting x.
 
-Self-edges (intra-role mesh, `from == to`) are legal traffic-wise but
-ignored for x-resolution. Cycles in the role graph are rejected at validate
-time (`400`, `role graph has a cycle involving: …`). The resolved x per role
+Self-edges (intra-app mesh, `from == to`) are legal traffic-wise but
+ignored for x-resolution. Cycles in the app graph are rejected at validate
+time (`400`, `role graph has a cycle involving: …`). The resolved x per app
 is logged at materialise time and visible per pod as the `worker_input_x`
 gauge.
 
@@ -487,7 +601,7 @@ The worker's full `STATE` dict — what it's currently doing.
 ```json
 {
   "running": true,
-  "x": <resolved-x-for-this-role>,
+  "x": <resolved-x-for-this-app>,
   "cpu_millicores": <cpu.a * x + cpu.b>,
   "ram_mb": <ram.a * x + ram.b>,
   "net_mbps": <net.a * x + net.b>,
@@ -496,7 +610,7 @@ The worker's full `STATE` dict — what it's currently doing.
 }
 ```
 
-For a templated worker, `x` is the *resolved* x for this pod's role, and
+For a templated worker, `x` is the *resolved* x for this pod's app, and
 `peers` is the list of concrete pod IPs (not Service names).
 
 ## `GET /metrics`
@@ -505,16 +619,22 @@ Prometheus text-format scrape endpoint. Gauges exposed:
 
 | Metric | Meaning |
 |--------|---------|
-| `worker_input_x` | Resolved x for this role |
+| `worker_input_x` | Resolved x for this app |
 | `worker_target_cpu_millicores` / `_ram_mb` / `_net_mbps` | `a * x + b` per resource |
 | `worker_actual_cpu_millicores` | 15s rolling average from cgroup `cpu.stat` |
 | `worker_actual_ram_mb` | cgroup working set (matches cAdvisor / Grafana) |
 | `worker_actual_net_mbps` | 15s rolling egress rate from `psutil.net_io_counters` |
 | `worker_cpu_stress_millicores` | CPU the feedback loop currently asks stress-ng to generate |
-| `worker_peer_egress_mbps{peer,peer_name}` | Measured egress to a specific peer IP (from iperf3 interval reports). `peer` is the pod IP; `peer_name` is the destination role |
-| `worker_peer_rtt_ms{peer,peer_name}` | TCP-handshake RTT to a peer pod, probed every 15s — includes injected inter-tier latency. `peer` is the pod IP; `peer_name` is the destination role |
+| `worker_peer_egress_mbps{peer}` | Measured egress to a specific peer (from iperf3 interval reports). `peer` is the peer pod's **IP address** — not a resolved app/role name |
+| `worker_peer_rtt_ms{peer}` | TCP-handshake RTT to a peer pod, probed every 15s — the real cluster network path (the controller injects nothing; compare against the declared `emulator_configured_rtt_ms`). `peer` is the peer pod's IP address |
 
-All gauges are scraped via the PodMonitor in `manifests/monitoring.yaml`.
+All gauges are scraped via the PodMonitor in `manifests/monitoring.yaml`, which
+copies each pod's `template`/`role` labels onto every scraped series
+(`podTargetLabels`) — so `role` is a real label you can group by, but there is
+**no `peer_name` label**: only the raw `peer` IP. Grouping by a `peer_name`
+label in PromQL (as some Grafana panels do) silently collapses every peer
+into one series, since a non-existent label groups as an empty string — group
+by `peer` (the IP) instead if you need to distinguish destinations.
 
 ```bash
 curl -s http://localhost:8080/metrics | grep -E "^worker_"
@@ -538,10 +658,11 @@ curl -s http://localhost:8080/metrics | grep -E "^worker_"
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET | `/overview` | Site-wide snapshot (subsumes `/health`) |
-| GET | `/measurements/now` | Live per-role state + gauges + edges |
+| GET | `/measurements/now` | Live per-app state + gauges + edges |
 | GET | `/measurements/range` | CPU/RAM/net aggregated over `?start`–`?end` |
 | GET | `/measurements/periods` | The last `?count` chunks of `?chunk` each, ending now |
 | GET | `/graph` | Grafana Node Graph payload (`?view=role\|pods`) |
+| GET | `/metrics` | Controller's own Prometheus scrape — declared `network_links` metrics |
 | GET | `/docs`, `/openapi.json` | Swagger UI (dark) and the generated spec |
 
 ## Worker (port-forward to access)

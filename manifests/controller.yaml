@@ -52,16 +52,6 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "create", "update", "patch", "delete", "deletecollection"]
-  # Chaos Mesh latency injection. materialise() refreshes NetworkChaos after
-  # creating pods so the latency covers them — via the pause/resume
-  # annotation (see controller/chaos.py). Chaos Mesh's own admission webhook
-  # (vauth) gates RESUMING an experiment on the requester holding broad
-  # chaos-mesh.org permissions in the target namespace — a single-resource
-  # grant is rejected with "forbidden on namespace", hence resources: ["*"].
-  # Namespace-scoped, and harmless if Chaos Mesh isn't installed.
-  - apiGroups: ["chaos-mesh.org"]
-    resources: ["*"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -75,8 +65,10 @@ roleRef:
   name: controller-emulator
   apiGroup: rbac.authorization.k8s.io
 ---
-# Nodes are cluster-scoped: chaos.py reads their tier labels to map worker
-# pods to tiers when checking template-defined latency coverage.
+# nodes are cluster-scoped, so listing them needs a ClusterRole (a namespaced
+# Role's rules for a cluster-scoped resource are ignored). netem.py's
+# _nodes_by_site() reads /api/v1/nodes to find each site's InternalIP for tc
+# shaping — without this, node discovery 403s and shaping silently no-ops.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -91,6 +83,8 @@ kind: ClusterRoleBinding
 metadata:
   name: controller-emulator-nodes
 subjects:
+  # ClusterRoleBindings aren't scoped by the manifest's apply namespace, so
+  # the ServiceAccount's namespace must be given explicitly.
   - kind: ServiceAccount
     name: controller-sa
     namespace: cloud-native-emulator
@@ -99,68 +93,66 @@ roleRef:
   name: controller-emulator-nodes
   apiGroup: rbac.authorization.k8s.io
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: v1
+kind: Pod
 metadata:
   name: controller
   labels:
     app: controller
 spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: controller
-  template:
-    metadata:
-      labels:
-        app: controller
-    spec:
-      serviceAccountName: controller-sa
-      # Run on the control-plane node (microk8s-vm). It carries the
-      # `dedicated=control-plane` taint to keep tier workloads off, so the
-      # controller needs a matching toleration plus a hostname nodeSelector
-      # to pin it there. Keeping the controller beside the API server keeps
-      # the emulated tiers (cloud/fog/edge) free of control logic.
-      nodeSelector:
-        kubernetes.io/hostname: microk8s-vm
-      tolerations:
-        - key: dedicated
-          operator: Equal
-          value: control-plane
-          effect: NoSchedule
-      containers:
-        - name: controller
-          image: jp36/emulator-controller:latest
-          imagePullPolicy: Always
-          ports:
-            # Named so the PodMonitor in monitoring.yaml can scrape /metrics
-            # (the configured inter-tier RTT) by port name.
-            - name: http
-              containerPort: 8081
-          env:
-            # Site identity — this controller's place in the larger cloud system.
-            # Every observability response carries {id, tier} so a future
-            # federation gateway can merge data across VMs. Set per VM.
-            - name: SITE_ID
-              value: "local"
-            - name: SITE_TIER
-              value: "cloud"
-            # Local timezone for /measurements/range: naive request timestamps
-            # are interpreted in it and response timestamps rendered in it
-            # (with offset). Also localises log timestamps.
-            - name: TZ
-              value: "Europe/London"
-            # Prometheus HTTP API base URL for the windowed /summary endpoint.
-            # Depends on your kube-prometheus-stack release/namespace — adjust to
-            # match. If unreachable, /summary degrades gracefully.
-            - name: PROM_URL
-              value: "http://kps-kube-prometheus-stack-prometheus.monitoring.svc:9090"
-          # TCP check rather than HTTP: /health was merged into GET /overview,
-          # which does k8s API + Prometheus work — too heavy to hit every probe
-          # period. Accepting a TCP connection proves the web layer is up.
-          readinessProbe:
-            tcpSocket: { port: 8081 }
-            periodSeconds: 2
+  serviceAccountName: controller-sa
+  # Plain in-cluster Pod — schedules on any available node. If you run a
+  # multi-tier cluster and want to keep the controller off the emulated tier
+  # nodes, add a nodeSelector/toleration for your control node here; nothing in
+  # the controller requires a particular node.
+  #
+  # A bare Pod (not a Deployment) is intentional: there is only ever one
+  # controller per site. The trade-off is that it is not self-healing — if it
+  # is deleted or evicted it won't be recreated (just re-apply this file), and
+  # picking up a new image is a delete + re-apply rather than a rollout. On a
+  # node reboot the kubelet restarts it in place, so that case is covered.
+  containers:
+    - name: controller
+      image: jp36/emulator-controller:latest
+      imagePullPolicy: Always
+      ports:
+        # Named so the PodMonitor in monitoring.yaml can scrape /metrics
+        # (the configured inter-tier RTT) by port name.
+        - name: http
+          containerPort: 8081
+      env:
+        # Site identity — this controller's place in the larger cloud system.
+        # Every observability response carries {id, tier} so a future
+        # federation gateway can merge data across VMs. Set per VM.
+        - name: SITE_ID
+          value: "local"
+        - name: SITE_TIER
+          value: "cloud"
+        # Local timezone for /measurements/range: naive request timestamps
+        # are interpreted in it and response timestamps rendered in it
+        # (with offset). Also localises log timestamps.
+        - name: TZ
+          value: "Europe/London"
+        # Prometheus HTTP API base URL for the windowed /summary endpoint.
+        # Depends on your kube-prometheus-stack release/namespace — adjust to
+        # match. If unreachable, /summary degrades gracefully.
+        - name: PROM_URL
+          value: "http://kps-kube-prometheus-stack-prometheus.monitoring.svc:9090"
+        # Enforced node pin for ALL worker pods: their nodeSelector becomes
+        # kubernetes.io/hostname=<this value>, so every pod lands on this node.
+        # Set to your node's name for single-node testing (run `kubectl get
+        # nodes` to find it); change it to another node, or set "" to schedule
+        # anywhere, once you have real nodes. A per-app `node` field overrides
+        # this for that app. (Separate from the declarative tier/placement in
+        # templates — this one actually places pods.)
+        - name: DEFAULT_NODE
+          value: "microk8s-vm"
+      # TCP check rather than HTTP: /health was merged into GET /overview,
+      # which does k8s API + Prometheus work — too heavy to hit every probe
+      # period. Accepting a TCP connection proves the web layer is up.
+      readinessProbe:
+        tcpSocket: { port: 8081 }
+        periodSeconds: 2
 ---
 apiVersion: v1
 kind: Service

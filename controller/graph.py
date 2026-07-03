@@ -113,7 +113,7 @@ def scrape_topology(name: str) -> dict | None:
     if info is None:
         return None
     template = info.get("template") or {}
-    roles = template.get("roles", {}) or {}
+    roles = template.get("apps", {}) or {}
     edges_def = template.get("edges", []) or []
     replicas = info.get("replicas", {}) or {}
 

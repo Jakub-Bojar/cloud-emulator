@@ -1,27 +1,194 @@
 {
   "name": "smart-campus",
   "x": 40,
-  "latency": {
-    "edge": { "fog": "10ms", "cloud": "100ms" },
-    "fog":  { "cloud": "40ms" }
-  },
-  "roles": {
-    "cameras":     { "count": 2, "tier": "edge",  "cpu": { "a": 1,   "b": 80 },  "ram": { "a": 0.5,  "b": 64 },  "net": { "a": 0.2,  "b": 4 } },
-    "iot-sensors": { "count": 3, "tier": "edge",  "cpu": { "a": 0.5, "b": 40 },  "ram": { "a": 0.25, "b": 40 },  "net": { "a": 0.1,  "b": 2 } },
-    "mobile-apps": { "count": 2, "tier": "fog",   "cpu": { "a": 1,   "b": 50 },  "ram": { "a": 0.5,  "b": 56 },  "net": { "a": 0.15, "b": 3 } },
-    "aggregator":  { "count": 2, "tier": "fog",   "cpu": { "a": 2,   "b": 60 },  "ram": { "a": 1,    "b": 96 },  "net": { "a": 0.25, "b": 2 } },
-    "api":         { "count": 2, "tier": "fog",   "cpu": { "a": 2.5, "b": 70 },  "ram": { "a": 1.5,  "b": 110 }, "net": { "a": 0.2,  "b": 2 } },
-    "analytics":   { "count": 2, "tier": "cloud", "cpu": { "a": 4,   "b": 100 }, "ram": { "a": 2,    "b": 160 }, "net": { "a": 0.1,  "b": 1 } },
-    "storage":     { "count": 1, "tier": "cloud", "cpu": { "a": 2,   "b": 80 },  "ram": { "a": 4,    "b": 256 }, "net": { "a": 0,    "b": 0 } }
+  "node_site_mapping": [
+    {
+      "k8s_node": "site-a",
+      "site_name": "site-A"
+    },
+    {
+      "k8s_node": "site-b",
+      "site_name": "site-B"
+    },
+    {
+      "k8s_node": "site-c",
+      "site_name": "site-C"
+    }
+  ],
+  "apps": {
+    "cameras": {
+      "cpu": {
+        "a": 1,
+        "b": 80
+      },
+      "ram": {
+        "a": 0.5,
+        "b": 64
+      },
+      "net": {
+        "a": 0.2,
+        "b": 4
+      },
+      "placements": [
+        {
+          "site": "site-A",
+          "count": 2
+        }
+      ]
+    },
+    "iot-sensors": {
+      "cpu": {
+        "a": 0.5,
+        "b": 40
+      },
+      "ram": {
+        "a": 0.25,
+        "b": 40
+      },
+      "net": {
+        "a": 0.1,
+        "b": 2
+      },
+      "placements": [
+        {
+          "site": "site-A",
+          "count": 3
+        }
+      ]
+    },
+    "mobile-apps": {
+      "cpu": {
+        "a": 1,
+        "b": 50
+      },
+      "ram": {
+        "a": 0.5,
+        "b": 56
+      },
+      "net": {
+        "a": 0.15,
+        "b": 3
+      },
+      "placements": [
+        {
+          "site": "site-B",
+          "count": 2
+        }
+      ]
+    },
+    "aggregator": {
+      "cpu": {
+        "a": 2,
+        "b": 60
+      },
+      "ram": {
+        "a": 1,
+        "b": 96
+      },
+      "net": {
+        "a": 0.25,
+        "b": 2
+      },
+      "placements": [
+        {
+          "site": "site-B",
+          "count": 2
+        }
+      ]
+    },
+    "api": {
+      "cpu": {
+        "a": 2.5,
+        "b": 70
+      },
+      "ram": {
+        "a": 1.5,
+        "b": 110
+      },
+      "net": {
+        "a": 0.2,
+        "b": 2
+      },
+      "placements": [
+        {
+          "site": "site-B",
+          "count": 2
+        }
+      ]
+    },
+    "analytics": {
+      "cpu": {
+        "a": 4,
+        "b": 100
+      },
+      "ram": {
+        "a": 2,
+        "b": 160
+      },
+      "net": {
+        "a": 0.1,
+        "b": 1
+      },
+      "placements": [
+        {
+          "site": "site-C",
+          "count": 2
+        }
+      ]
+    },
+    "storage": {
+      "cpu": {
+        "a": 2,
+        "b": 80
+      },
+      "ram": {
+        "a": 4,
+        "b": 256
+      },
+      "net": {
+        "a": 0,
+        "b": 0
+      },
+      "placements": [
+        {
+          "site": "site-C",
+          "count": 1
+        }
+      ]
+    }
   },
   "edges": [
-    { "from": "cameras",     "to": "aggregator" },
-    { "from": "iot-sensors", "to": "aggregator" },
-    { "from": "mobile-apps", "to": "api" },
-    { "from": "aggregator",  "to": "analytics" },
-    { "from": "api",         "to": "analytics" },
-    { "from": "api",         "to": "storage" },
-    { "from": "analytics",   "to": "storage" },
-    { "from": "cameras",     "to": "storage" }
+    {
+      "from": "cameras",
+      "to": "aggregator"
+    },
+    {
+      "from": "iot-sensors",
+      "to": "aggregator"
+    },
+    {
+      "from": "mobile-apps",
+      "to": "api"
+    },
+    {
+      "from": "aggregator",
+      "to": "analytics"
+    },
+    {
+      "from": "api",
+      "to": "analytics"
+    },
+    {
+      "from": "api",
+      "to": "storage"
+    },
+    {
+      "from": "analytics",
+      "to": "storage"
+    },
+    {
+      "from": "cameras",
+      "to": "storage"
+    }
   ]
 }

@@ -2,48 +2,51 @@
 # Worker-template blueprint (parameterized)
 # ============================================================================
 # This file is NOT meant to be `kubectl apply`-ed directly. The controller
-# reads it as a stencil: for each role in a posted template it substitutes
+# reads it as a stencil: for each app in a posted template it substitutes
 # the placeholders below and POSTs the resulting objects to the Kubernetes
 # API. Keeping the blueprint as a real YAML file lets you read, edit, and
 # lint it without touching controller code.
 #
 # Placeholders the controller substitutes:
 #   __TEMPLATE__   the template's name        (e.g. "frontend-backend")
-#   __ROLE__       the role's name            (e.g. "frontend")
-#   __COUNT__      replicas for this role     (e.g. "3")
+#   __ROLE__       the app's name             (e.g. "frontend")
+#   __COUNT__      replicas for this app      (e.g. "3")
 #   __IMAGE__      worker image + tag         (e.g. "jp36/emulator-worker:latest")
 #
 # Per template, the controller creates one (ConfigMap + Deployment + Service)
-# group per role. For a template named "demo" with roles "frontend" and
-# "backend" the cluster ends up with:
+# group per app. (At the k8s level each app is still labelled `role=<app>`, so
+# the __ROLE__ placeholder and the wt-<template>-<app> resource names are
+# unchanged.) For a template named "demo" with apps "frontend" and "backend"
+# the cluster ends up with:
 #
 #   ConfigMap/wt-demo-frontend-config   Deployment/wt-demo-frontend   Service/wt-demo-frontend
 #   ConfigMap/wt-demo-backend-config    Deployment/wt-demo-backend    Service/wt-demo-backend
 #
 # ----------------------------------------------------------------------------
-# Example /templates POST body
+# Example /template POST body
 # ----------------------------------------------------------------------------
 # {
 #   "name": "frontend-backend",
 #   "x": 50,
-#   "latency": {
-#     "edge": { "fog": "10ms", "cloud": "100ms" },
-#     "fog":  { "cloud": "40ms" }
-#   },
-#   "roles": {
+#   "node_site_mapping": [
+#     { "k8s_node": "edge-1",  "site_name": "site-A" },
+#     { "k8s_node": "cloud-1", "site_name": "site-B" }
+#   ],
+#   "network_links": [
+#     { "from": "site-A", "to": "site-B", "rtt_ms": 100, "bandwidth_mbps": 500 }
+#   ],
+#   "apps": {
 #     "frontend": {
-#       "count": 1,
-#       "tier": "edge",
 #       "cpu": {"a": 20, "b": 200},
 #       "ram": {"a": 8,  "b": 128},
-#       "net": {"a": 0.5, "b": 5}
+#       "net": {"a": 0.5, "b": 5},
+#       "placements": [ { "site": "site-A", "count": 1 } ]
 #     },
 #     "backend": {
-#       "count": 3,
-#       "tier": "cloud",
 #       "cpu": {"a": 5, "b": 50},
 #       "ram": {"a": 2, "b": 32},
-#       "net": {"a": 0.1, "b": 1}
+#       "net": {"a": 0.1, "b": 1},
+#       "placements": [ { "site": "site-B", "count": 3 } ]
 #     }
 #   },
 #   "edges": [
@@ -51,16 +54,31 @@
 #   ]
 # }
 #
-# `edges` are directional: every pod of `from` sends iperf3 traffic to the
-# Service of `to`. So `frontend -> backend` with backend.count = 3 is a
-# 1-to-many fan-out (k8s Service round-robins TCP connects across backend
-# pods). A many-to-many mesh is expressed as multiple edges.
+# `edges` are directional app-to-app links: every pod of `from` sends iperf3
+# traffic to the Service of `to`. So `frontend -> backend` with backend.count
+# = 3 is a 1-to-many fan-out (k8s Service round-robins TCP connects across
+# backend pods). A many-to-many mesh is expressed as multiple edges.
 #
-# `tier` (optional, per role) pins the role's pods to nodes labelled
-# `tier=<value>`. `latency` (optional) declares the round-trip time between
-# tier pairs; the controller turns each pair into a Chaos Mesh NetworkChaos
-# (half the RTT per direction), keeps them re-resolved across pod churn, and
-# deletes them on teardown — see controller/chaos.py and API.md.
+# `node_site_mapping` (optional, top-level) is the template's own site → k8s
+# node registry: each entry maps a real Kubernetes node name to a logical site
+# name used by `placements` and `network_links`. This replaces node labelling
+# entirely — the controller pins pods directly by hostname
+# (nodeSelector kubernetes.io/hostname), so no `kubectl label node` step is
+# needed. `network_links` declares the round-trip time (rtt_ms) and optional
+# bandwidth cap (bandwidth_mbps) between site pairs — the controller applies
+# these with `tc netem`/`htb` on each site's node NIC (controller/netem.py);
+# see TEMPLATE.md and API.md.
+#
+# Per app, `placements` (array) is the site-based placement form: each entry's
+# `site`/`sites` name must appear in `node_site_mapping`, resolved to a real
+# node and pinned there — one Deployment per site, counts summed to give the
+# app's total replica count. The legacy singular `placement` (object) form
+# still works unchanged for raw node-label/hostname placement without
+# `node_site_mapping`: `{"on": {label: value}}`, `{"node": "hostname"}`, or
+# `{"nodes": [{"node", "count"}]}`. An app uses one or the other, never both.
+# `DEFAULT_NODE` (controller env, not a template field) is the fallback node
+# for an app with neither — handy for single-node testing; it overrides
+# `placements`' site resolution entirely.
 # ============================================================================
 ---
 apiVersion: v1
@@ -130,6 +148,13 @@ spec:
             # fan-out; bump to 8+ for many-to-many.
             - name: IPERF_PORT_COUNT
               value: "2"
+            # UDP datagram length for the iperf3 net generator (the `-l` flag).
+            # Larger datagrams carry the same Mbps in far fewer syscalls, which
+            # cuts the CPU floor a net-heavy pod would otherwise have. "" / "0"
+            # falls back to iperf3's default. Only applies when the net transport
+            # is UDP — the default; set NET_PROTOCOL=tcp here to switch to TCP.
+            - name: IPERF_UDP_LEN
+              value: "32K"
             # stress-ng --cpu-load duty-cycle slice (ms). Small values break
             # the busy/idle loading into fine slices for much smoother CPU and
             # better load accuracy when pods share a node (stress-ng's default
@@ -145,7 +170,8 @@ spec:
             #   CPU_GAIN               fraction of error closed per step (0.6)
             #   CPU_ADJUST_INTERVAL_S  seconds between corrections; keep >= the
             #                          15 s rolling CPU window (15)
-            #   CPU_TOLERANCE_MC       deadband floor in millicores (15)
+            #   CPU_TOLERANCE_MC       deadband floor in millicores (5, set below —
+            #                          code default is 15 if unset)
             - name: CPU_GAIN
               value: "0.6"
             - name: CPU_ADJUST_INTERVAL_S

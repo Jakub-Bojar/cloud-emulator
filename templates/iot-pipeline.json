@@ -1,43 +1,114 @@
 {
   "name": "iot-pipeline",
   "x": 50,
-  "latency": {
-    "edge": { "fog": "10ms", "cloud": "100ms" },
-    "fog":  { "cloud": "40ms" }
-  },
-  "roles": {
+  "node_site_mapping": [
+    {
+      "k8s_node": "site-a",
+      "site_name": "site-A"
+    },
+    {
+      "k8s_node": "site-b",
+      "site_name": "site-B"
+    },
+    {
+      "k8s_node": "site-c",
+      "site_name": "site-C"
+    }
+  ],
+  "apps": {
     "sensor": {
-      "count": 3,
-      "tier": "edge",
-      "cpu": {"a": 0.2, "b": 50},
-      "ram": {"a": 0.1, "b": 43},
-      "net": {"a": 0.15, "b": 3}
+      "cpu": {
+        "a": 0.2,
+        "b": 50
+      },
+      "ram": {
+        "a": 0.1,
+        "b": 43
+      },
+      "net": {
+        "a": 0.15,
+        "b": 3
+      },
+      "placements": [
+        {
+          "site": "site-A",
+          "count": 3
+        }
+      ]
     },
     "gateway": {
-      "count": 1,
-      "tier": "fog",
-      "cpu": {"a": 2, "b": 50},
-      "ram": {"a": 0.5, "b": 110},
-      "net": {"a": 0.5, "b": 5}
+      "cpu": {
+        "a": 2,
+        "b": 50
+      },
+      "ram": {
+        "a": 0.5,
+        "b": 110
+      },
+      "net": {
+        "a": 0.5,
+        "b": 5
+      },
+      "placements": [
+        {
+          "site": "site-B",
+          "count": 1
+        }
+      ]
     },
     "ingest": {
-      "count": 1,
-      "tier": "cloud",
-      "cpu": {"a": 5, "b": 100},
-      "ram": {"a": 1, "b": 235},
-      "net": {"a": 0.2, "b": 3}
+      "cpu": {
+        "a": 5,
+        "b": 100
+      },
+      "ram": {
+        "a": 1,
+        "b": 235
+      },
+      "net": {
+        "a": 0.2,
+        "b": 3
+      },
+      "placements": [
+        {
+          "site": "site-C",
+          "count": 1
+        }
+      ]
     },
     "db": {
-      "count": 1,
-      "tier": "cloud",
-      "cpu": {"a": 1, "b": 70},
-      "ram": {"a": 0, "b": 512},
-      "net": {"a": 0, "b": 0}
+      "cpu": {
+        "a": 1,
+        "b": 70
+      },
+      "ram": {
+        "a": 0,
+        "b": 512
+      },
+      "net": {
+        "a": 0,
+        "b": 0
+      },
+      "placements": [
+        {
+          "site": "site-C",
+          "count": 1
+        }
+      ]
     }
   },
   "edges": [
-    {"from": "sensor", "to": "gateway"},
-    {"from": "gateway", "to": "ingest"},
-    {"from": "ingest", "to": "db"}
+    {
+      "from": "sensor",
+      "to": "gateway"
+    },
+    {
+      "from": "gateway",
+      "to": "ingest"
+    },
+    {
+      "from": "ingest",
+      "to": "db"
+    }
   ]
 }

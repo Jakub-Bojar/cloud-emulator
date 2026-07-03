@@ -53,45 +53,66 @@ class ScenarioRunner:
                 return ph
         return None
 
+    def _apply_phase(self, ph: dict, elapsed_min: float) -> bool:
+        """Apply `ph`'s x via patch_system_x unless it is already the active
+        phase. Deduped by phase id so we don't re-materialise every tick. Returns
+        True only if it actually applied (a phase change)."""
+        phase_id = ph.get("phase_id") or str(ph["start_min"])
+        if phase_id == self._last_phase_id:
+            return False
+        log.info("runner: entering phase %r x=%s (elapsed=%.1f min)",
+                 phase_id, ph["x"], elapsed_min)
+        try:
+            materialiser.patch_system_x(self._name, ph["x"])
+            self._last_phase_id = phase_id
+            return True
+        except Exception as exc:
+            log.warning("runner: patch_system_x failed (%s) — will retry", exc)
+            return False
+
     def _run(self) -> None:
         _logged_complete = False
         # wait(timeout) blocks until the event is set or the timeout expires;
-        # returns True (stop requested) or False (tick).
+        # returns True (stop requested) or False (tick). The clock is wall-clock
+        # from runner start: if the host is suspended (e.g. a laptop sleeps),
+        # ticks don't fire while it's asleep, so phases whose windows elapsed
+        # during the suspension are skipped — we reconcile to whatever phase is
+        # current on the next tick (and to the final phase once the schedule
+        # ends, below) rather than replaying the missed ones.
         while not self._stop_event.wait(timeout=TICK_INTERVAL):
             elapsed_min = (time.time() - self._t0) / 60.0
             ph = self._active_phase(elapsed_min)
             if ph is None:
-                if self._phases and not _logged_complete:
-                    last = self._phases[-1]
-                    if elapsed_min >= last["end_min"]:
+                # Past the end of the schedule (or a gap before it begins). Hold
+                # the final phase's x — and APPLY it now if it was never applied
+                # tick-by-tick (e.g. the host slept through that phase's window
+                # so the runner jumped straight here), so the end state is right.
+                last = self._phases[-1] if self._phases else None
+                if last is not None and elapsed_min >= last["end_min"]:
+                    self._apply_phase(last, elapsed_min)
+                    if not _logged_complete:
                         log.info("runner: scenario complete for %r — "
                                  "holding final x=%s", self._name, last["x"])
                         _logged_complete = True
                 continue
 
-            phase_id = ph.get("phase_id") or str(ph["start_min"])
-            if phase_id == self._last_phase_id:
-                continue  # still in the same phase
-
-            log.info("runner: entering phase %r x=%s (elapsed=%.1f min)",
-                     phase_id, ph["x"], elapsed_min)
-            try:
-                materialiser.patch_system_x(self._name, ph["x"])
-                self._last_phase_id = phase_id
-            except Exception as exc:
-                log.warning("runner: patch_system_x failed (%s) — will retry", exc)
+            self._apply_phase(ph, elapsed_min)
 
 
 def start(doc: dict, template_name: str) -> None:
-    """Start a runner for `doc`. Replaces any existing runner. No-op if the
-    doc has no runtime_scenarios."""
+    """(Re)start the scenario runner for `doc`.
+
+    Always replaces any existing runner: a doc WITH runtime_scenarios starts a
+    fresh runner from t0=now, a doc WITHOUT them just stops whatever was running
+    (so removing the scenarios via PATCH halts the stepping)."""
     global _current
     phases = materialiser.scenario_x_timeline(doc)
-    if not phases:
-        return
     with _lock:
         if _current is not None:
             _current.stop()
+            _current = None
+        if not phases:
+            return
         r = ScenarioRunner(phases, template_name)
         r.start()
         _current = r

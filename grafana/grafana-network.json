@@ -1,7 +1,7 @@
 {
   "uid": "emulator-network",
   "title": "Emulator — Network",
-  "description": "Inter-tier network behaviour per node-to-node link: latency (configured one-way delay vs measured one-way latency) and bandwidth (measured throughput per link). Latency values are one-way (the measured TCP round-trip halved, since the inject is symmetric) so they line up with the configured one-way delay; throughput is the measured iperf3 egress summed across the source role's pods.",
+  "description": "Inter-tier network behaviour per node-to-node link: latency (configured one-way vs measured one-way) and bandwidth (configured cap vs measured throughput). The configured values are declarative — the template declares them and the controller does not implement them, so the measured values reflect the real cluster path. Latency is shown one-way (the measured TCP round-trip halved) to line up with the configured one-way panel; throughput is the measured iperf3 egress summed across the source role's pods.",
   "tags": ["emulator", "network", "latency", "bandwidth"],
   "timezone": "browser",
   "refresh": "30s",
@@ -24,7 +24,7 @@
         "name": "base_ms",
         "type": "textbox",
         "label": "Base one-way RTT to subtract (ms)",
-        "description": "Unshaped network latency between nodes, subtracted from the measured value so the latency panels track the configured inject. ~half the node-to-node round-trip base (≈3ms here). Set 0 to see the raw measurement.",
+        "description": "Unshaped base network latency between nodes, optionally subtracted from the measured value. ~half the node-to-node round-trip base (≈3ms here). Set 0 to see the raw measurement.",
         "query": "3",
         "current": { "text": "3", "value": "3" },
         "hide": 0
@@ -43,7 +43,7 @@
       "id": 1,
       "type": "stat",
       "title": "Configured latency between nodes",
-      "description": "One-way latency configured in the template for each tier pair (e.g. edge -> fog = 10ms means 10ms A→B and 10ms B→A). Updates immediately on PATCH.",
+      "description": "One-way latency configured in the template's network_links for each site pair (e.g. edge_01 -> fog_01 = 10ms means 10ms A→B and 10ms B→A). Updates immediately on PATCH.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 6, "w": 24, "x": 0, "y": 1 },
       "fieldConfig": {
@@ -72,7 +72,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "emulator_configured_one_way_ms",
+          "expr": "emulator_configured_rtt_ms / 2",
           "legendFormat": "{{pair}}",
           "instant": true
         }
@@ -82,7 +82,7 @@
       "id": 2,
       "type": "table",
       "title": "Measured one-way latency between nodes — min / avg / max (selected period)",
-      "description": "One row per node-to-node link (source tier → destination tier), averaged across the source pods, over the selected time range — one-way (the measured TCP round-trip halved; valid because the injected delay is symmetric). Min ≈ the configured one-way delay — compare it directly against the configured panel above. Avg/Max sit higher because the netem timer slips under VM scheduling jitter and queuing, so they overstate the true link delay. The unshaped base RTT is subtracted via the `base_ms` control at the top (set it to 0 to see the raw measurement); any remainder above the configured value is real queuing under load.",
+      "description": "One row per node-to-node link (source tier → destination tier), averaged across the source pods, over the selected time range — one-way (the measured TCP round-trip halved). Compare it against the configured panel above to see how the real cluster path compares to what the template declares; they match only if a separate system provisions the link. The unshaped base RTT can be subtracted via the `base_ms` control at the top (set it to 0 to see the raw measurement).",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 9, "w": 24, "x": 0, "y": 7 },
       "fieldConfig": {
@@ -140,7 +140,7 @@
       "id": 3,
       "type": "timeseries",
       "title": "One-way latency between nodes (time series)",
-      "description": "Measured one-way latency for each node-to-node link (source tier → destination tier), averaged across the source pods, over the selected time range — set the range with the dashboard time picker (top-right) to see the last X minutes. TCP round-trip halved, probed every 15s; tracks the injected link delay (tc netem) plus real network jitter. The unshaped base RTT is subtracted via the `base_ms` control at the top (set it to 0 for the raw measurement).",
+      "description": "Measured one-way latency for each node-to-node link (source tier → destination tier), averaged across the source pods, over the selected time range — set the range with the dashboard time picker (top-right) to see the last X minutes. TCP round-trip halved, probed every 15s; this is the real cluster network path. The unshaped base RTT can be subtracted via the `base_ms` control at the top (set it to 0 for the raw measurement).",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 12, "w": 24, "x": 0, "y": 16 },
       "fieldConfig": {
@@ -174,7 +174,7 @@
       "id": 6,
       "type": "stat",
       "title": "Configured bandwidth between nodes",
-      "description": "Bandwidth cap configured in the template for each tier pair (e.g. edge -> fog = 1000mbps means the tc rate limit applied on the link in each direction). Updates immediately on PATCH. The throughput panels below should sit at or under these caps.",
+      "description": "Bandwidth cap declared in the template's network_links for each site pair (e.g. edge_01 ↔ fog_01 = 1000mbps). Declarative — it describes the cap for another system to enforce; the controller does not enforce it. Updates immediately on PATCH. Compare the measured throughput panels below against it.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 6, "w": 24, "x": 0, "y": 29 },
       "fieldConfig": {
@@ -209,7 +209,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "Throughput between nodes (time series)",
-      "description": "Measured egress throughput for each node-to-node link (source tier → destination tier), summed across the source role's pods, from worker_peer_egress_mbps (parsed from the iperf3 client's per-second interval reports). This is the actual traffic crossing the link; compare it against the configured bandwidth cap above (which tc enforces on the tier node's NIC). Values are converted to bits/sec so Grafana auto-scales to Mb/s.",
+      "description": "Measured egress throughput for each node-to-node link (source tier → destination tier), summed across the source role's pods, from worker_peer_egress_mbps (parsed from the iperf3 client's per-second interval reports). This is the actual traffic crossing the link; compare it against the declared bandwidth cap above. Values are converted to bits/sec so Grafana auto-scales to Mb/s.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 12, "w": 24, "x": 0, "y": 35 },
       "fieldConfig": {

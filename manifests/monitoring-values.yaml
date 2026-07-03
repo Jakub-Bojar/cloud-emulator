@@ -36,26 +36,56 @@ grafana:
 
   # Provisioned so the URL survives helm upgrades. Editing it in the Grafana UI
   # does NOT stick — the kps datasource sidecar reasserts this value, so the UI
-  # change reverts on the next reconcile/restart. `url` is the host-run
-  # controller as seen FROM the cluster VMs (the Mac's cluster-facing IP, == the
-  # VM default gateway). ENVIRONMENT-SPECIFIC: update it if the multipass/cluster
-  # network changes — find it with:
-  #   multipass exec microk8s-vm -- ip route | awk '/default/{print $3}'
-  # access: proxy means the Grafana *server* fetches it, so it must be reachable
-  # from the Grafana pod (localhost there is the pod, not your Mac).
+  # change reverts on the next reconcile/restart. `url` is the in-cluster
+  # controller Service (the controller runs as a pod again); the cluster-DNS
+  # name resolves from the Grafana pod. Adjust the namespace if you deploy the
+  # controller elsewhere. access: proxy means the Grafana *server* fetches it,
+  # so it must be reachable from the Grafana pod.
   additionalDataSources:
     - name: Infinity
       type: yesoreyeram-infinity-datasource
       access: proxy
       isDefault: false
-      url: http://192.168.2.1:8081
+      url: http://controller-service.cloud-native-emulator.svc:8081
       jsonData:
         allowedHosts:
-          - http://192.168.2.1:8081
+          - http://controller-service.cloud-native-emulator.svc:8081
         tlsSkipVerify: true
+    # Second Infinity instance for the Model-calibration dashboard
+    # (grafana/grafana-calibration.json). Infinity prepends a datasource's
+    # base `url` to every query URL, so calibration files need their own
+    # datasource rather than a second allowedHosts entry on the one above.
+    # The base URL is a plain file server on the multipass HOST serving the
+    # repo's calibration/ directory:
+    #   python3 -m http.server 8000 --directory calibration
+    # 192.168.2.1 is the host's address on the VM's bridged network (the VM's
+    # default gateway) — adjust if yours differs. The dashboard references
+    # this datasource by the fixed uid.
+    - name: Infinity Calibration
+      type: yesoreyeram-infinity-datasource
+      uid: infinity-calibration
+      access: proxy
+      isDefault: false
+      url: http://192.168.2.1:8000
+      jsonData:
+        allowedHosts:
+          - http://192.168.2.1:8000
 
-# NOTE: Prometheus is intentionally NOT pinned to microk8s-vm — it's RAM-hungry
-# and the 1.9 GiB control-plane node would OOM. If you bump microk8s-vm's memory
-# (e.g. 4 GiB) you can pin it too with the same nodeSelector + toleration. For
-# now only Grafana (light, ~250 MiB) moves to the persistent node; if Prometheus
-# briefly reschedules on a node delete it just re-scrapes — Grafana stays up.
+  # Expose Grafana on a stable NodePort (http://<host>:30300). Declared here so
+  # it survives helm upgrades — a manual `kubectl patch` to NodePort gets reset
+  # back to ClusterIP on the next upgrade (which is exactly what happened once).
+  service:
+    type: NodePort
+    nodePort: 30300
+
+# Expose Prometheus on a stable NodePort (http://<host>:30090) for the same reason.
+prometheus:
+  service:
+    type: NodePort
+    nodePort: 30090
+
+# NOTE: Prometheus is not pinned to a node here. The VM was raised to 8 GiB after
+# it OOMed running the monitoring stack + emulator workload together, so Prometheus
+# could now be pinned with the same nodeSelector + toleration as Grafana if wanted.
+# Grafana (light, ~250 MiB) is pinned to the persistent node so its dashboards and
+# settings survive a reschedule; Prometheus just re-scrapes if it moves.
