@@ -19,61 +19,52 @@ least-squares fits **a** and **b** per axis. The resulting block pastes
 straight into a template app (see [TEMPLATE.md](../TEMPLATE.md), "The formula",
 and [templates/llm-load.json](../templates/llm-load.json) for a real example).
 
-One script, no extra binaries. Needs Python 3.10+ and the `requests` library —
-a virtual environment is the cleanest way to get both without touching your
-system Python:
+One script, no extra binaries. Needs Python 3.10+ and the `requests` +
+`prometheus_client` libraries — a virtual environment is the cleanest way to
+get both without touching your system Python:
 
 ```bash
 python3 -m venv calibration/.venv
 calibration/.venv/bin/pip install -r calibration/requirements.txt
+chmod +x calibration/calibrate.py
 ```
 
-Then run the script through that venv's Python, e.g.
-`calibration/.venv/bin/python3 calibration/calibrate.py ...` (or
-`source calibration/.venv/bin/activate` once per shell session and just use
-`python3` normally).
+That's a **one-time** setup. `calibrate.py`'s shebang line points straight at
+`calibration/.venv/bin/python3`, so every example below just runs
+`calibration/calibrate.py ...` directly — no `python3` prefix, no
+activating, no venv to remember, in any terminal tab. (This does mean the
+shebang hardcodes an absolute path tied to *this* checkout — if you ever move
+or re-clone the repo, re-run the `chmod +x` line above and update the first
+line of `calibrate.py` to the new path.)
 
 ## Quick start
 
 Any OpenAI-compatible server works (Ollama, vLLM, llama.cpp, LM Studio,
-LocalAI, sd.cpp, …). Activate the venv once per shell session, then pick the
-mode that matches your model:
+LocalAI, sd.cpp, …). Pick the mode that matches your model:
 
 ```bash
-source calibration/.venv/bin/activate
-
 # text -> text  (e.g. Ollama)
 ollama pull llama3.2:3b
 OLLAMA_NUM_PARALLEL=8 ollama serve &
-python3 calibration/calibrate.py --mode text2text --model llama3.2:3b
+calibration/calibrate.py --mode text2text --model llama3.2:3b
 
 # image -> text  (vision model; a synthetic PNG is built in, or --image calibration/images/photo.jpg)
 ollama pull llava:7b
-python3 calibration/calibrate.py --mode image2text --model llava:7b
+calibration/calibrate.py --mode image2text --model llava:7b
 
 # text -> image  (any server with /v1/images/generations, e.g. LocalAI)
-python3 calibration/calibrate.py --mode text2image --model sd-1.5 \
+calibration/calibrate.py --mode text2image --model sd-1.5 \
     --host http://localhost:8080 --x 0 1 2 4
 
 # image -> image
-python3 calibration/calibrate.py --mode image2image --model sd-1.5 \
+calibration/calibrate.py --mode image2image --model sd-1.5 \
     --host http://localhost:8080 --image calibration/images/in.png --x 0 1 2 4
 ```
 
-(Prefer not to activate anything? Run each command as
-`calibration/.venv/bin/python3 calibration/calibrate.py ...` instead — same effect, no shell state.)
-
-> **Running this needs multiple terminal tabs — and activation doesn't carry
-> between them.** A typical run has up to three tabs open at once: one for
-> the model server (`ollama serve`), one for `python3 -m http.server`
-> (needed later for Grafana), and one for `calibrate.py` itself. `source
-> calibration/.venv/bin/activate` only affects the *one tab* you ran it in —
-> open a new tab and `python3` there is back to your system Python, with no
-> `requests` installed (you'll see `ModuleNotFoundError: No module named
-> 'requests'`). Either re-run the `source ...activate` line in every new tab,
-> or skip activation entirely and always call
-> `calibration/.venv/bin/python3 calibration/calibrate.py ...` by its full
-> path — that works from any tab, activated or not.
+A typical run still spans multiple terminal tabs (the model server in one,
+`python3 -m http.server` for Grafana in another, `calibrate.py` in a third) —
+but since there's no activation step anymore, a fresh tab just works, no
+extra setup needed in it.
 
 ### Customizing the input
 
@@ -84,20 +75,20 @@ representative fit:
 
 ```bash
 # your own prompt
-python3 calibration/calibrate.py --mode text2text --model llama3.2:3b \
+calibration/calibrate.py --mode text2text --model llama3.2:3b \
     --prompt "Summarize this support ticket in three sentences."
 
 # your own image, with your own prompt about it
-python3 calibration/calibrate.py --mode image2text --model llava:7b \
+calibration/calibrate.py --mode image2text --model llava:7b \
     --image calibration/images/photo.png --prompt "List every object visible in this photo."
 
 # your own generation prompt (image-output modes)
-python3 calibration/calibrate.py --mode text2image --model sd-1.5 \
+calibration/calibrate.py --mode text2image --model sd-1.5 \
     --host http://localhost:8080 \
     --prompt "a photorealistic mountain landscape at sunset"
 
 # your own source image to edit, with your own prompt
-python3 calibration/calibrate.py --mode image2image --model sd-1.5 \
+calibration/calibrate.py --mode image2image --model sd-1.5 \
     --host http://localhost:8080 --image calibration/images/in.png \
     --prompt "add a red bicycle leaning against the wall"
 ```
@@ -117,8 +108,15 @@ output side the same way.
 
 Each run writes, next to this README:
 
-- `<model>-<mode>.csv` — the measured levels
-- `<model>-<mode>.fit.json` — everything, including the paste-ready `load` block
+- `<model>-<mode>-<timestamp>.csv` — the measured levels
+- `<model>-<mode>-<timestamp>.fit.json` — everything, including the paste-ready `load` block
+
+`<timestamp>` is the run's start time (`YYYYMMDD-HHMMSS`), so re-running the
+same model/mode never overwrites a previous result — every run gets its own
+pair of files, and they sort chronologically. The `.fit.json` also carries
+the same timestamp as a `run_started` field, in case the file ever gets
+renamed. Pass `--out` yourself to skip this and use an exact name of your
+choosing (that name is used as-is, no timestamp added).
 
 and prints the block to paste into a template app:
 
@@ -227,10 +225,10 @@ disable this endpoint entirely for a given run.
 | `--max-tokens` | `200` | Completion token cap for the chat modes (`text2text`, `image2text`). |
 | `--size` | `512x512` | Output image size for the image-generation modes (`text2image`, `image2image`). |
 | `--proc-match` | regex covering ollama/llama.cpp/vllm/mlx/lm-studio/text-generation/local-ai/stable-diffusion/comfyui/invokeai/a1111/fooocus | Case-insensitive regex matching your model server's process, so `ps`-based CPU/RAM sampling finds it. Override if your server binary is something else. |
-| `--out` | `calibration/<model>-<mode>.csv` | Where to write the CSV. The `.fit.json` lands right next to it, same base name. |
+| `--out` | `calibration/<model>-<mode>-<timestamp>.csv` | Where to write the CSV. The `.fit.json` lands right next to it, same base name. The default's `<timestamp>` (run start, `YYYYMMDD-HHMMSS`) keeps repeat runs from overwriting each other; an explicit `--out` is used exactly as given, no timestamp added. |
 | `--metrics-port` | `9877` | Port for the live Prometheus `/metrics` endpoint (see [Watching a run live](#watching-a-run-live-alongside-the-emulator)). `0` disables it. |
 
-Run `python3 calibration/calibrate.py --help` any time for this same list straight from the source.
+Run `calibration/calibrate.py --help` any time for this same list straight from the source.
 
 ## How to read the result
 

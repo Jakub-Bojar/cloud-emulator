@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/Users/jakubbojarski/Documents/Developer/GitHub/Personal/cloud-emulator/calibration/.venv/bin/python3
 """
 Universal model calibrator — derive the emulator's (a, b) coefficients from a
 real model running on this machine.
@@ -81,6 +81,7 @@ import sys
 import threading
 import time
 import zlib
+from datetime import datetime
 
 import requests
 from prometheus_client import Gauge, start_http_server
@@ -416,6 +417,8 @@ AXES = (("cpu", "cpu_millicores", "millicores"),
         ("net", "net_mbps", "Mbps"))
 
 def main() -> None:
+    run_started = datetime.now()  # stamps the default output filename, so
+                                  # repeat runs never overwrite each other
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -506,9 +509,10 @@ def main() -> None:
                 max(0.0, fits[axis]["a"] * r["x"] + fits[axis]["b"]), 4)
 
     safe_model = re.sub(r"[^A-Za-z0-9._-]+", "-", args.model)
+    timestamp = run_started.strftime("%Y%m%d-%H%M%S")
     out_path = args.out or os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        f"{safe_model}-{args.mode}.csv")
+        f"{safe_model}-{args.mode}-{timestamp}.csv")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     cols = ["x", "cpu_millicores", "ram_mb", "net_mbps",
             "throughput", "requests", "failed_rate", "latency_ms"]
@@ -523,6 +527,7 @@ def main() -> None:
     json_path = os.path.splitext(out_path)[0] + ".fit.json"
     with open(json_path, "w") as f:
         json.dump({"model": args.model, "mode": args.mode, "x": args.x,
+                   "run_started": run_started.isoformat(timespec="seconds"),
                    "throughput_unit": thr_unit, "rows": rows, "fits": fits,
                    # fits as an array + load as a string: the shapes the
                    # Grafana calibration dashboard's table/stat panels want.
