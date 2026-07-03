@@ -1,0 +1,583 @@
+{
+  "uid": "model-calibration",
+  "title": "Model calibration",
+  "description": "Visualises a calibration/calibrate.py run: measured CPU/RAM/network per concurrency level x, the least-squares fit load = a*x + b, and the paste-ready template block. Reads the .fit.json through the provisioned 'Infinity Calibration' datasource (manifests/monitoring-values.yaml), whose base URL is a file server on the host: python3 -m http.server 8000 --directory calibration. Set the 'fit.json file' variable to the file to view.",
+  "tags": [
+    "emulator",
+    "calibration"
+  ],
+  "timezone": "browser",
+  "refresh": "",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "templating": {
+    "list": [
+      {
+        "name": "fit_file",
+        "type": "textbox",
+        "label": "fit.json file",
+        "description": "Path of a calibrate.py .fit.json relative to the datasource's base URL, e.g. /llama3.2-3b-text2text.fit.json (serve with: python3 -m http.server 8000 --directory calibration)",
+        "query": "/llama3.2-3b-text2text.fit.json",
+        "current": {
+          "text": "/llama3.2-3b-text2text.fit.json",
+          "value": "/llama3.2-3b-text2text.fit.json"
+        },
+        "hide": 0,
+        "options": []
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "barchart",
+      "title": "CPU (millicores) vs x",
+      "gridPos": {
+        "h": 10,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "infinity-calibration"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fit"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "measured"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "orientation": "auto",
+        "xField": "x",
+        "xTickLabelRotation": 0,
+        "xTickLabelSpacing": 0,
+        "showValue": "auto",
+        "stacking": "none",
+        "groupWidth": 0.7,
+        "barWidth": 0.97,
+        "barRadius": 0,
+        "fullHighlight": false,
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "infinity-calibration"
+          },
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "${fit_file}",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "rows",
+          "columns": [
+            {
+              "selector": "x",
+              "text": "x",
+              "type": "number"
+            },
+            {
+              "selector": "cpu_millicores",
+              "text": "measured",
+              "type": "number"
+            },
+            {
+              "selector": "cpu_fit",
+              "text": "fit",
+              "type": "number"
+            }
+          ],
+          "parser": "backend"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "barchart",
+      "title": "RAM (MB) vs x",
+      "gridPos": {
+        "h": 10,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "infinity-calibration"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fit"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "measured"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "orientation": "auto",
+        "xField": "x",
+        "xTickLabelRotation": 0,
+        "xTickLabelSpacing": 0,
+        "showValue": "auto",
+        "stacking": "none",
+        "groupWidth": 0.7,
+        "barWidth": 0.97,
+        "barRadius": 0,
+        "fullHighlight": false,
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "infinity-calibration"
+          },
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "${fit_file}",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "rows",
+          "columns": [
+            {
+              "selector": "x",
+              "text": "x",
+              "type": "number"
+            },
+            {
+              "selector": "ram_mb",
+              "text": "measured",
+              "type": "number"
+            },
+            {
+              "selector": "ram_fit",
+              "text": "fit",
+              "type": "number"
+            }
+          ],
+          "parser": "backend"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "barchart",
+      "title": "Network (Mbps) vs x",
+      "gridPos": {
+        "h": 10,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "infinity-calibration"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fit"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "measured"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "orientation": "auto",
+        "xField": "x",
+        "xTickLabelRotation": 0,
+        "xTickLabelSpacing": 0,
+        "showValue": "auto",
+        "stacking": "none",
+        "groupWidth": 0.7,
+        "barWidth": 0.97,
+        "barRadius": 0,
+        "fullHighlight": false,
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "infinity-calibration"
+          },
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "${fit_file}",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "rows",
+          "columns": [
+            {
+              "selector": "x",
+              "text": "x",
+              "type": "number"
+            },
+            {
+              "selector": "net_mbps",
+              "text": "measured",
+              "type": "number"
+            },
+            {
+              "selector": "net_fit",
+              "text": "fit",
+              "type": "number"
+            }
+          ],
+          "parser": "backend"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "Fit — load = a·x + b (R² near 1 = the line describes the model well)",
+      "gridPos": {
+        "h": 6,
+        "w": 14,
+        "x": 0,
+        "y": 10
+      },
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "infinity-calibration"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "infinity-calibration"
+          },
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "${fit_file}",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "fit_table",
+          "columns": [
+            {
+              "selector": "axis",
+              "text": "axis",
+              "type": "string"
+            },
+            {
+              "selector": "unit",
+              "text": "unit",
+              "type": "string"
+            },
+            {
+              "selector": "a",
+              "text": "a (slope per x)",
+              "type": "number"
+            },
+            {
+              "selector": "b",
+              "text": "b (idle floor)",
+              "type": "number"
+            },
+            {
+              "selector": "r2",
+              "text": "R²",
+              "type": "number"
+            }
+          ],
+          "parser": "backend"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Paste into a template app (cpu/ram/net)",
+      "gridPos": {
+        "h": 6,
+        "w": 10,
+        "x": 14,
+        "y": 10
+      },
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "infinity-calibration"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/.*/"
+        },
+        "textMode": "value",
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "infinity-calibration"
+          },
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "${fit_file}",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "load_json",
+              "text": "load",
+              "type": "string"
+            }
+          ],
+          "parser": "backend"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "Measured levels",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "infinity-calibration"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "infinity-calibration"
+          },
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "${fit_file}",
+          "url_options": {
+            "method": "GET",
+            "data": ""
+          },
+          "root_selector": "rows",
+          "columns": [
+            {
+              "selector": "x",
+              "text": "x",
+              "type": "number"
+            },
+            {
+              "selector": "cpu_millicores",
+              "text": "cpu (mc)",
+              "type": "number"
+            },
+            {
+              "selector": "ram_mb",
+              "text": "ram (MB)",
+              "type": "number"
+            },
+            {
+              "selector": "net_mbps",
+              "text": "net (Mbps)",
+              "type": "number"
+            },
+            {
+              "selector": "throughput",
+              "text": "throughput (tok/s or img/min)",
+              "type": "number"
+            },
+            {
+              "selector": "requests",
+              "text": "requests",
+              "type": "number"
+            },
+            {
+              "selector": "failed_rate",
+              "text": "failed rate",
+              "type": "number"
+            },
+            {
+              "selector": "latency_ms",
+              "text": "latency (ms)",
+              "type": "number"
+            }
+          ],
+          "parser": "backend"
+        }
+      ]
+    }
+  ]
+}

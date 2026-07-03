@@ -1,0 +1,29 @@
+# Lets the in-cluster Prometheus scrape calibrate.py's live /metrics endpoint
+# (calibration_cpu_millicores / calibration_ram_mb / calibration_net_mbps /
+# calibration_x — see calibration/calibrate.py's --metrics-port) so a real
+# calibration run shows up live in Grafana, alongside the "Worker Emulator —
+# Target vs Actual" dashboard's own panels, for direct comparison.
+#
+# Set HOST_IP to your Mac's address as seen FROM the cluster VMs (find it with:
+#   multipass exec microk8s-vm -- ip route | awk '/default/{print $3}'
+# or use the multipass gateway — 192.168.2.1 on the default bridge). Then:
+#   multipass exec microk8s-vm -- microk8s kubectl apply -f - < manifests/host-calibration-scrape.yaml
+#
+# Requires the ScrapeConfig CRD (kube-prometheus-stack ships it in recent
+# versions — same one manifests/host-controller-scrape.yaml relied on).
+# calibrate.py only serves /metrics while it's actually running, so this
+# scrape target goes quiet (and the Grafana panels flatline) between runs —
+# that's expected, not a fault.
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: host-calibration
+  namespace: monitoring
+  labels:
+    release: kps           # match your kube-prometheus-stack release label
+spec:
+  staticConfigs:
+    - targets:
+        - "HOST_IP:9877"   # <-- replace HOST_IP with the Mac's cluster-facing address
+  metricsPath: /metrics
+  scrapeInterval: 5s        # short interval — this is meant to feel "live"
