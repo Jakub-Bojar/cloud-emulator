@@ -3,16 +3,76 @@
 A resource-emulation framework for the EEECS summer research project
 *"High-Fidelity Emulation Framework for Cloud-Native Applications."*
 
-You describe a **topology** of apps (e.g. gateway → auth/api → cache → db)
-as JSON; the controller materialises one Kubernetes Deployment + ConfigMap +
-Service per app and runs synthetic CPU, RAM, and network load in every pod
-sized to per-app formulas. An input signal `x` propagates through the
-app graph, so changing it recasts load across the whole topology (and a single
-template can seed several independent sub-systems at different `x`).
-The template can also declare `node_site_mapping` (a site name → k8s node
-registry), per-app `placements` resolved through it, and `network_links`
-(round-trip latency + bandwidth) between sites — enforced pod placement and
-real `tc netem`/`htb` link shaping, no node labelling required.
+Testing a cloud-native application across edge, fog and cloud is harder than
+it should be. A real multi-site testbed is expensive and awkward to reproduce,
+and the workloads worth testing — an LLM inference service, a live video
+pipeline, a sensor fan-in — are far too heavy to stand up at cluster scale just
+to see how one placement decision plays out. Pure simulation is cheap, but it
+never touches a real scheduler, a real kernel or a real network stack, so its
+answers are only as good as its model. This project sits between the two: it
+runs **real Kubernetes, real CPU/RAM/network load and real network delay**,
+while the application itself is a synthetic stand-in — light enough to
+replicate across hundreds of pods, and described entirely by one JSON file you
+can version, diff and re-run.
+
+The stand-in works like this. An application is modelled as a **directed
+acyclic graph**: each node is one component of the system, and each edge is the
+flow of information from one component to the next. Every component declares
+what it costs as a straight line — `value = a·x + b`, once per resource (CPU in
+millicores, RAM in MB, network in Mbps) — where `x` is the input signal
+arriving at it. `x` enters at the graph's source components and propagates
+downstream, each component's `x` being the sum of the egress of everything
+upstream of it, resolved by a topological pass over the graph. That leaves you
+one dial: raise `x` and load recasts itself across every component at once, in
+the proportions the graph implies. And `a` and `b` needn't be guesses —
+[calibration/calibrate.py](calibration/calibrate.py) drives a real application
+at a sweep of `x` values, measures its CPU/RAM/network, and least-squares fits
+the two coefficients per resource. What you emulate afterwards is a measured
+footprint of something real, at a scale you could never afford to run for real.
+
+Put together, the running system is a small multi-site cluster you drive over
+HTTP and watch in Grafana. Several VMs stand in for the sites of a real
+deployment, Kubernetes schedules the components across them, the links between
+those sites are shaped to whatever latency and bandwidth you asked for, and the
+application on top is just the DAG you declared. Three parts, all controlled
+from the same template:
+
+- **Sites are VMs.** One [Multipass](https://multipass.run) VM per site — edge,
+  fog, cloud — joined into a single MicroK8s cluster that does the scheduling.
+  The template's `node_site_mapping` maps site names to real node hostnames and
+  a component's `placements` pins its pods to a site through `nodeSelector`, so
+  a component you place at the edge genuinely runs on the edge VM.
+- **Links are programmable.** `network_links` declares round-trip latency
+  (`rtt_ms`) and an optional bandwidth cap (`bandwidth_mbps`) between site
+  pairs. The controller applies each one with Linux `tc` on that site's node
+  NIC — `netem` for the delay, `htb` for the cap
+  ([controller/netem.py](controller/netem.py)) — and republishes the declared
+  figures as metrics, so the network you asked for can be compared against the
+  one the workers actually measure. (Shaping runs `tc` over `multipass exec`;
+  see [RUNBOOK.md](RUNBOOK.md) for where that works and where it doesn't.)
+- **Applications are DAGs.** `POST` a template and the controller materialises
+  one Kubernetes Deployment + ConfigMap + Service per component. Worker pods
+  then generate the declared load for real — `stress-ng` for CPU, an anonymous
+  `mmap` for RAM, `iperf3` along the graph's edges for network — while
+  Prometheus and Grafana report target vs. actual per resource, per-link
+  latency and bandwidth, and a node-graph of the measured topology.
+
+```
+          POST /template {x, apps, edges, node_site_mapping, network_links}
+   operator ─────────────────────────────────▶ ┌──────────────┐
+   GET /overview · /measurements/* · /graph     │ controller   │ NodePort 30081
+                                                │ materialiser │
+                                                └──────┬───────┘
+                              create/patch via k8s API │
+                 ┌───────────────────────┬─────────────┴─────────────┐
+                 ▼                        ▼                           ▼
+         Deployment+CM+Svc        Deployment+CM+Svc            Deployment+CM+Svc
+           (app: gateway)           (app: api ×N)                (app: db)
+              worker pods  ◀── iperf3 peer traffic ──▶  worker pods
+                 │ /metrics scrape    (network_links shaped via tc netem)
+                 ▼
+          Prometheus ──▶ Grafana
+```
 
 Each controller is the **site API for one VM** and manages exactly one
 template. Every observability response is tagged with a `{site}` block
@@ -20,6 +80,8 @@ template. Every observability response is tagged with a `{site}` block
 merged by a federation layer later.
 
 ## How it works
+
+The same picture again, field by field — the names you'll actually type.
 
 - **Template** — a named set of `apps` connected by directional `edges`.
   Each app has linear formulas for CPU (millicores), RAM (MB), and network
@@ -55,23 +117,6 @@ merged by a federation layer later.
   resource, plus per-peer RTT); the controller fuses k8s state + live scrapes
   + Prometheus into the measurement endpoints, and serves a Grafana
   node-graph of measured edges.
-
-```
-          POST /template {x, apps, edges, node_site_mapping, network_links}
-   operator ─────────────────────────────────▶ ┌──────────────┐
-   GET /overview · /measurements/* · /graph     │ controller   │ NodePort 30081
-                                                │ materialiser │
-                                                └──────┬───────┘
-                              create/patch via k8s API │
-                 ┌───────────────────────┬─────────────┴─────────────┐
-                 ▼                        ▼                           ▼
-         Deployment+CM+Svc        Deployment+CM+Svc            Deployment+CM+Svc
-           (app: gateway)           (app: api ×N)                (app: db)
-              worker pods  ◀── iperf3 peer traffic ──▶  worker pods
-                 │ /metrics scrape    (network_links shaped via tc netem)
-                 ▼
-          Prometheus ──▶ Grafana
-```
 
 ## Documentation
 
