@@ -933,6 +933,51 @@ def _apply(resource: dict) -> None:
     raise RuntimeError(f"k8s API error applying {kind}/{name}: {status}")
 
 
+def _prune_orphan_deployments(template_name: str, app_name: str,
+                              keep: set[str]) -> None:
+    """Delete this app's Deployments that the template no longer declares.
+
+    An app's Deployment names depend on how many placement targets it has:
+    one target keeps the plain `wt-<t>-<app>`, several get a `-<i>` suffix
+    each (see _render_app). So re-materialising a template whose placement
+    changed target count doesn't just re-shape the existing Deployments —
+    it *renames* them, and the ones under the old names keep running their
+    pods. Those pods stay in the app's Service (it selects the broad
+    {template, role}), so upstream apps keep sending them traffic and the
+    emulated load no longer matches the template.
+
+    Called after an app's Deployments are applied, so there is never a
+    window with no Deployment for the app. Scoping the list by the `role`
+    label rather than by name prefix keeps this exact: apps whose names
+    share a prefix (`store`, `store-cache`) never prune each other.
+
+    Never raises. A failed prune leaves stale pods running — bad, but not
+    worse than aborting a materialise that has otherwise applied cleanly,
+    and the next materialise retries the prune.
+    """
+    selector = (f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE},"
+                f"{TEMPLATE_LABEL}={template_name},{ROLE_LABEL}={app_name}")
+    status, body = k8s.get(_kind_path("Deployment", label_selector=selector))
+    if status != 200:
+        log.warning("prune %s/%s: listing Deployments failed: status=%s",
+                    template_name, app_name, status)
+        return
+    for item in json.loads(body).get("items", []):
+        dep_name = item.get("metadata", {}).get("name")
+        if not dep_name or dep_name in keep:
+            continue
+        # 404 means someone else already removed it — the desired end state.
+        del_status, del_body = k8s.delete(_kind_path("Deployment", dep_name))
+        if del_status in (200, 202, 404):
+            log.info("pruned orphan Deployment/%s (template=%s role=%s): no "
+                     "longer in the app's placement targets %s",
+                     dep_name, template_name, app_name, sorted(keep))
+        else:
+            log.warning("prune Deployment/%s failed: status=%s body=%s — its "
+                        "pods are still running and still in the %s Service",
+                        dep_name, del_status, del_body[:200], app_name)
+
+
 # ----------------------------------------------------------------------------
 # Public API
 # ----------------------------------------------------------------------------
@@ -943,7 +988,10 @@ def materialise(template: dict, source: str = SOURCE_HTTP) -> None:
     Two phases:
       1. Apply every Deployment/Service/ConfigMap with an empty peers
          list. Workers come up with their HTTP servers + iperf3 server
-         pool but no outbound peer traffic.
+         pool but no outbound peer traffic. Each app is then pruned of
+         Deployments the new placement no longer names — see
+         _prune_orphan_deployments for why re-materialising can rename
+         them.
       2. Wait for each Service's Endpoints to populate, then patch the
          per-role ConfigMap's `peers` field with the concrete pod IPs
          that are now backing each target Service. Workers re-read the
@@ -996,8 +1044,17 @@ def materialise(template: dict, source: str = SOURCE_HTTP) -> None:
                 ann = meta.setdefault("annotations", {})
                 ann[TEMPLATE_ANNOTATION] = template_annotation
                 ann[SOURCE_ANNOTATION] = source
+        applied_deployments: set[str] = set()
         for doc in docs:
             _apply(doc)
+            if doc.get("kind") == "Deployment":
+                applied_deployments.add(doc["metadata"]["name"])
+        # Re-materialising an app whose placement target count changed renames
+        # its Deployments (`wt-<t>-<app>` ⇄ `wt-<t>-<app>-<i>`), so the ones
+        # under the old names would otherwise keep running pods that the
+        # template no longer declares — and keep serving them through the
+        # app's Service. Drop them now that the new set is applied.
+        _prune_orphan_deployments(name, role_name, applied_deployments)
 
     # ─── Phase 2: resolve peers to pod IPs and patch ConfigMaps ─────────
     log.info("Template %s: waiting for endpoints to populate…", name)
