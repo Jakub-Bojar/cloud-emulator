@@ -138,15 +138,14 @@ spec:
         # match. If unreachable, /summary degrades gracefully.
         - name: PROM_URL
           value: "http://kps-kube-prometheus-stack-prometheus.monitoring.svc:9090"
-        # Enforced node pin for ALL worker pods: their nodeSelector becomes
-        # kubernetes.io/hostname=<this value>, so every pod lands on this node.
-        # Set to your node's name for single-node testing (run `kubectl get
-        # nodes` to find it); change it to another node, or set "" to schedule
-        # anywhere, once you have real nodes. A per-app `node` field overrides
-        # this for that app. (Separate from the declarative tier/placement in
-        # templates — this one actually places pods.)
+        # Single-node testing only. When set, every worker pod is pinned to
+        # this node (nodeSelector kubernetes.io/hostname=<value>), and that
+        # overrides templates' `placements`/`node_site_mapping` too — on a
+        # multi-node cluster it silently collapses every site onto one node.
+        # Leave "" so templates decide where pods run; set it to your node's
+        # name (`kubectl get nodes`) only on a one-node cluster.
         - name: DEFAULT_NODE
-          value: "microk8s-vm"
+          value: ""
       # TCP check rather than HTTP: /health was merged into GET /overview,
       # which does k8s API + Prometheus work — too heavy to hit every probe
       # period. Accepting a TCP connection proves the web layer is up.

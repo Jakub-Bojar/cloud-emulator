@@ -54,7 +54,7 @@ _NODE_GAUGES = (
     "worker_actual_cpu_millicores", "worker_target_cpu_millicores",
     "worker_actual_ram_mb", "worker_target_ram_mb",
     "worker_actual_net_mbps", "worker_target_net_mbps",
-    "worker_input_x",
+    "worker_input_x", "worker_config_ok",
 )
 
 

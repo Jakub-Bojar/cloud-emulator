@@ -202,16 +202,29 @@ declared content round-trips via `GET /template`.
   "peers": {
     "ingest": ["wt-<name>-store"],
     "store": []
+  },
+  "warnings": [                         // anything only partly done; [] if none
+    "wt-<name>-store: 1 of 2 pods Ready after 30s; peers were wired to the Ready ones only — check for Pending or crashing pods",
+    "network link site-A ↔ site-B is NOT shaped: 'multipass' not found where the controller runs, …"
+  ],
+  "network_shaping": {                  // per-link tc outcome (see GET /overview)
+    "status": "not_applied",            // none | applied | partial | not_applied
+    "links": { "site-A ↔ site-B": { "applied": false, "reason": "…" } }
   }
 }
 ```
+
+A 201 means the template was accepted and applied — not that every part took
+effect. Check `warnings`: pods that never became Ready (unschedulable,
+crashing) and `network_links` that couldn't be shaped are listed there rather
+than failing the request.
 
 **Status codes:**
 
 | Code | Meaning |
 |------|---------|
 | 201 | Materialised |
-| 400 | Invalid JSON, validation failure, cycle in the app graph, bad `placement`/`placements`, or a `network_links`/`placements` site name with no matching `node_site_mapping` entry |
+| 400 | Invalid JSON, validation failure, cycle in the app graph, bad `placement`/`placements`, a `network_links`/`placements` site name with no matching `node_site_mapping` entry, or a node (`node_site_mapping[].k8s_node`, `placement.node`/`nodes`, or the controller's `DEFAULT_NODE`) that isn't in the cluster — nothing is created |
 | 409 | A *different* template is already materialised — PATCH or DELETE it first |
 | 502 | A k8s API call failed mid-materialisation. Partial resources may exist — re-POST or DELETE to clean up |
 
@@ -237,6 +250,10 @@ sync) — **no pod restart** unless the change adds/removes pods. A patch that
 changes `network_links` re-applies `tc netem`/`htb` shaping immediately
 (`materialise()` calls `netem.apply()` unconditionally on every
 materialisation, including PATCH-triggered ones).
+
+The merged result is validated against the same schema as a `POST` body
+(400 on anything `POST` would reject), and the response carries the same
+`warnings` and `network_shaping` fields as `POST`.
 
 **Merge semantics:**
 
@@ -360,11 +377,22 @@ curl http://192.168.2.2:30081/overview | python3 -m json.tool
   "templates": [
     {"name": "<name>", "source": "http",
      "roles": {"<app>": {"desired": 2, "ready": 2}},
-     "pods": {"total": 3, "ready": 3}}
+     "pods": {"total": 3, "ready": 3},
+     "config_errors": []}
   ],
-  "prometheus": {"available": true, "url": "http://…:9090"}
+  "prometheus": {"available": true, "url": "http://…:9090"},
+  "network_shaping": {"status": "applied",
+                      "links": {"site-A ↔ site-B": {"applied": true}}}
 }
 ```
+
+`config_errors` lists Ready pods whose latest config was rejected (they keep
+running the previous one, so k8s still reports them healthy) — read from each
+worker's `worker_config_ok` gauge.
+
+`network_shaping` is the outcome of the most recent materialise (`status`
+`none` when the template declares no links, `unknown` until the first
+materialise after a controller restart).
 
 ## `GET /measurements/now`
 
@@ -397,13 +425,19 @@ curl http://192.168.2.2:30081/measurements/now | python3 -m json.tool
       "pods": [{"name": "wt-<name>-<app>-abc123", "ip": "10.1.0.42",
                 "node": "node-1", "phase": "Running", "ready": true,
                 "restarts": 0, "age_seconds": 312,
-                "metrics": {"x": 10.0, "target_cpu_millicores": 50.0, "...": "..."}}]
+                "metrics": {"x": 10.0, "target_cpu_millicores": 50.0,
+                            "config_ok": 1.0, "...": "..."}}],
+      "config_errors": []   // pods still on a previous config (theirs was rejected)
     }
   },
   "edges": [{"from": "<app-a>", "to": "<app-b>", "mbps": 3.912}],
   "prometheus": {"available": null}
 }
 ```
+
+`config_errors` names pods whose latest config was rejected: their targets are
+a previous config's until a good one arrives. `prometheus.available` is always
+`null` here — this endpoint doesn't query Prometheus.
 
 `404` if nothing is materialised.
 
@@ -531,6 +565,7 @@ template on every scrape (so a PATCH retune shows up at once):
 |--------|--------|---------|
 | `emulator_configured_rtt_ms` | `pair` (`"site-A ↔ site-B"`) | Declared round-trip latency per site pair |
 | `emulator_configured_bandwidth_mbps` | `pair` | Declared per-direction bandwidth cap per site pair (only pairs that declared one) |
+| `emulator_link_shaping_applied` | `pair` | `1` if that link's `tc` shaping is in effect as of the last materialise, `0` if it was skipped or failed — where it's `0`, the configured values are intent only |
 
 Compare these against the workers' *measured* `worker_peer_rtt_ms` /
 `worker_peer_egress_mbps` to see how the real `tc netem`-shaped path compares
@@ -620,7 +655,8 @@ Prometheus text-format scrape endpoint. Gauges exposed:
 | Metric | Meaning |
 |--------|---------|
 | `worker_input_x` | Resolved x for this app |
-| `worker_target_cpu_millicores` / `_ram_mb` / `_net_mbps` | `a * x + b` per resource |
+| `worker_target_cpu_millicores` / `_ram_mb` / `_net_mbps` | `a * x + b` per resource — except net is `0` for an app with no outbound edges, which has nowhere to send |
+| `worker_config_ok` | `1` if the latest config from the ConfigMap was applied, `0` if it was rejected (malformed, or applying it failed) — the pod then keeps running its last good config; the worker log says why |
 | `worker_actual_cpu_millicores` | 15s rolling average from cgroup `cpu.stat` |
 | `worker_actual_ram_mb` | cgroup working set (matches cAdvisor / Grafana) |
 | `worker_actual_net_mbps` | 15s rolling egress rate from `psutil.net_io_counters` |

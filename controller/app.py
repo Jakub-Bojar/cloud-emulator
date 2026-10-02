@@ -26,7 +26,11 @@ Endpoints
 ---------
 POST   /template           materialise the posted template. Re-POSTing the
                            same name re-materialises idempotently; 409 if a
-                           different template is already materialised
+                           different template is already materialised;
+                           400 if it names a node the cluster doesn't have.
+                           POST and PATCH responses carry `warnings` (pods
+                           not Ready in time, links not shaped) and
+                           `network_shaping` (per-link tc outcome)
 GET    /template           the materialised template, in full (404 if none)
 PATCH  /template           partial update — merge, re-resolve, re-materialise.
                            Change anything: x, an app's cpu/ram/net/count/tier,
@@ -41,7 +45,9 @@ Observability (see api.py / API.md)
 -----------------------------------
 GET    /overview               site-wide snapshot; subsumes the old /health
                                ("ok": true). The k8s readiness probe uses a
-                               TCP-socket check instead (see controller.yaml)
+                               TCP-socket check instead (see controller.yaml).
+                               Includes `network_shaping` as of the last
+                               materialise
 GET    /measurements/now       fused k8s + live worker metrics, instantaneous
 GET    /measurements/range     CPU/RAM/net aggregated between ?start and ?end
                                (ISO 8601 or unix; default: the last 15 min)
@@ -64,12 +70,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 import api
 import graph
 import linkspec
 import materialiser
+import netem
 import runner
 import watcher
 
@@ -407,7 +414,7 @@ def create_template(template: Template):
                 409, f"template {existing[0]!r} is already materialised; "
                      "PATCH it, or DELETE it before posting a new one")
         log.info("Materialising template %s", body.get("name"))
-        materialiser.materialise(body)
+        report = materialiser.materialise(body)
     # (Re)start the scenario runner outside the write lock: a template with
     # runtime_scenarios begins stepping its x on a clock; one without stops any
     # runner left over from a previous template.
@@ -416,7 +423,28 @@ def create_template(template: Template):
     # network_links, per-app tier/node/placement, scenarios) plus the
     # controller-derived resolved x, effective node, and peers — see
     # materialiser.describe.
-    return _stamp({"name": body["name"], **materialiser.describe(body)})
+    # `warnings` lists anything only partly done (pods never Ready, links not
+    # shaped); `network_shaping` is the per-link tc outcome. A 201 means the
+    # template was accepted and applied, not that every part took effect.
+    return _stamp({"name": body["name"], **materialiser.describe(body),
+                   **report})
+
+
+def _normalise_patched(merged: dict) -> dict:
+    """Hold a PATCH-merged template to the same schema as a POST body.
+
+    PATCH bodies are free-form (dot-paths, partial objects), so they can't be
+    modelled up front — but the merged result can. Without this a PATCH could
+    store values POST would reject (e.g. a string coefficient), which reach the
+    workers and break them. Returns the dump POST would have stored."""
+    try:
+        template = Template.model_validate(merged)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
+            for err in exc.errors())
+        raise ValueError(f"patched template is invalid: {problems}") from exc
+    return template.model_dump(by_alias=True, exclude_none=True)
 
 
 @app.patch("/template")
@@ -426,9 +454,11 @@ def patch_template(patch: dict):
     patch.pop("timestamp", None)  # injected by GET /template; not content
     with _write_lock:
         name = _single_template_name()
-        merged = materialiser.patch_template(name, patch)
-    if merged is None:
+        result = materialiser.patch_template(name, patch,
+                                             normalise=_normalise_patched)
+    if result is None:
         raise HTTPException(404, "no template materialised")
+    merged, report = result
     # Re-sync the scenario runner to the merged template: edits to
     # runtime_scenarios take effect (and restart the clock from now), and an
     # x-only PATCH that the runner itself made never reaches here.
@@ -437,6 +467,7 @@ def patch_template(patch: dict):
         "name": name,
         "template": merged,
         "peers": materialiser.compute_peers(merged),
+        **report,
     })
 
 
@@ -504,7 +535,10 @@ def get_graph(
 def overview():
     # "ok" subsumes the old /health endpoint: if this handler runs, the web
     # layer is alive. The rest is the site snapshot from api.overview().
-    return _stamp({"ok": True, **api.overview()})
+    # network_shaping: whether the template's network_links are actually in
+    # effect (as of the last materialise) — see netem.last_result.
+    return _stamp({"ok": True, **api.overview(),
+                   "network_shaping": netem.last_result()})
 
 
 @app.get("/measurements/now")

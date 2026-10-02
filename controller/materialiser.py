@@ -17,8 +17,10 @@ up to the controller's HTTP handler.
 import copy
 import json
 import logging
+import math
 import os
 import time
+from typing import Callable
 
 import yaml
 
@@ -36,8 +38,9 @@ WORKER_IMAGE = os.environ.get("WORKER_IMAGE",
 # Controller-wide fallback node for worker pods. When non-empty, an app with no
 # `placement` gets `nodeSelector: {kubernetes.io/hostname: DEFAULT_NODE}`, so all
 # such pods land on that one node — handy for single-node testing (set it to your
-# VM's name). An app's own `placement` always wins over this. Empty (default) =
-# no fallback pin, unplaced pods schedule anywhere.
+# VM's name). An app's own `placement` object wins over this, but `placements`
+# (site names) does not: it collapses onto DEFAULT_NODE (see _placement_targets).
+# Empty (default) = no fallback pin, unplaced pods schedule anywhere.
 DEFAULT_NODE = os.environ.get("DEFAULT_NODE", "").strip()
 
 # The well-known node label every node carries (its name). We pin by hostname
@@ -350,6 +353,15 @@ def validate(template: dict) -> None:
             sub = role.get(axis)
             if not isinstance(sub, dict) or "a" not in sub or "b" not in sub:
                 raise ValueError(f"app {role_name!r}.{axis} must have 'a' and 'b'")
+            # The worker evaluates these as floats; a non-number here would
+            # only fail inside the worker, after the template was accepted.
+            for coef in ("a", "b"):
+                v = sub[coef]
+                if (isinstance(v, bool) or not isinstance(v, (int, float))
+                        or not math.isfinite(v)):
+                    raise ValueError(
+                        f"app {role_name!r}.{axis}.{coef} must be a number, "
+                        f"got {v!r}")
         # `placement` decides where this app's pods actually run — on nodes
         # matching arbitrary labels (`on` [+`spread`]), pinned to one `node`,
         # or split across `nodes` with per-node counts (one Deployment per
@@ -624,16 +636,70 @@ def _get_endpoint_pods(service_name: str) -> list[tuple[str, str]]:
     return result
 
 
+def _owning_deployment(pod_name: str) -> str:
+    """`<deployment>-<pod-template-hash>-<suffix>` → `<deployment>`."""
+    return pod_name.rsplit("-", 2)[0]
+
+
+def _rollout_complete(dep_name: str) -> bool:
+    """True once every pod of Deployment `dep_name` runs its current spec and
+    no pod from an older ReplicaSet is still active (the same test as
+    `kubectl rollout status`). Terminating pods drop out of both these counts
+    and the Service's Endpoints, so after this the Endpoints converge on
+    exactly the Deployment's current pods."""
+    status, body = k8s.get(_kind_path("Deployment", dep_name))
+    if status != 200:
+        return False
+    dep = json.loads(body)
+    want = dep.get("spec", {}).get("replicas", 1)
+    st = dep.get("status") or {}
+    return (st.get("observedGeneration", 0)
+            >= dep.get("metadata", {}).get("generation", 0)
+            and st.get("updatedReplicas", 0) == want
+            and st.get("replicas", 0) == want
+            and st.get("availableReplicas", 0) == want)
+
+
 def _wait_for_endpoint_pods(service_name: str, want_count: int,
-                             timeout: float = 30.0) -> list[tuple[str, str]]:
-    """Poll until at least `want_count` (pod_name, ip) pairs are Ready."""
+                             deployments: set[str] | None = None,
+                             timeout: float = 30.0,
+                             warnings: list[str] | None = None,
+                             ) -> list[tuple[str, str]]:
+    """Poll until the Service's Ready (pod_name, ip) pairs are the app's.
+
+    Without `deployments`: until at least `want_count` pairs are Ready.
+
+    With `deployments` (the app's current Deployment names): only pods owned
+    by those Deployments count, every one of them must have finished rolling
+    out, and the count must be exactly `want_count`. Right after a
+    re-materialise the Endpoints still list the previous pods — those of a
+    just-pruned Deployment, or an older ReplicaSet mid rolling update — and
+    they stay Ready until they terminate. Accepting them would hand upstream
+    apps IPs that are about to disappear, and nothing re-resolves peers
+    afterwards, so the edge would carry no traffic until the next
+    materialise.
+
+    On timeout returns what was Ready, and appends a line to `warnings` so
+    the caller can tell the user rather than only the log."""
     deadline = time.monotonic() + timeout
     last: list[tuple[str, str]] = []
     while time.monotonic() < deadline:
         last = _get_endpoint_pods(service_name)
-        if len(last) >= want_count:
-            return last
+        if deployments is None:
+            if len(last) >= want_count:
+                return last
+        else:
+            last = [(pod, ip) for (pod, ip) in last
+                    if _owning_deployment(pod) in deployments]
+            if (len(last) == want_count
+                    and all(_rollout_complete(d) for d in deployments)):
+                return last
         time.sleep(1.0)
+    if warnings is not None:
+        warnings.append(
+            f"{service_name}: {len(last)} of {want_count} pods Ready after "
+            f"{timeout:.0f}s; peers were wired to the Ready ones only — check "
+            "for Pending or crashing pods")
     if last:
         log.warning("endpoints for %s: got %d of %d expected within %.0fs",
                     service_name, len(last), want_count, timeout)
@@ -645,6 +711,8 @@ def _wait_for_endpoint_pods(service_name: str, want_count: int,
 
 def _resolve_peer_ips(
         template: dict,
+        deployments_by_role: dict[str, set[str]] | None = None,
+        warnings: list[str] | None = None,
 ) -> tuple[dict[str, list[str]], dict[str, dict[str, int]], dict[str, int]]:
     """Expand each role's peer Services into bare pod IPs and assign each
     source pod a port offset so it lands on a unique iperf3 server port on
@@ -671,7 +739,12 @@ def _resolve_peer_ips(
         iperf3 server slots each target role needs: (highest offset of any
         pod connecting to it) + 1. May exceed the raw fanin since greedy
         colouring isn't guaranteed minimal, but it never collides.
+
+    `deployments_by_role` names each app's current Deployments (as just
+    applied by materialise). When given, only those Deployments' rolled-out
+    pods are resolved — see _wait_for_endpoint_pods.
     """
+    deps = deployments_by_role or {}
     name = template["name"]
     prefix = f"wt-{name}-"
     intended = compute_peers(template)
@@ -687,14 +760,17 @@ def _resolve_peer_ips(
             continue
         src_count = _effective_count(template["apps"][src_role])
         src_pods_by_role[src_role] = sorted(
-            _wait_for_endpoint_pods(prefix + src_role, src_count),
+            _wait_for_endpoint_pods(prefix + src_role, src_count,
+                                    deps.get(src_role), warnings=warnings),
             key=lambda t: t[0])
         for svc in services:
             if svc not in ip_cache:
                 trole = svc[len(prefix):]
                 want = _effective_count(template["apps"][trole])
                 ip_cache[svc] = [ip for (_, ip)
-                                 in _wait_for_endpoint_pods(svc, want)]
+                                 in _wait_for_endpoint_pods(
+                                     svc, want, deps.get(trole),
+                                     warnings=warnings)]
             for ip in ip_cache[svc]:
                 if ip not in resolved[src_role]:
                     resolved[src_role].append(ip)
@@ -982,7 +1058,50 @@ def _prune_orphan_deployments(template_name: str, app_name: str,
 # Public API
 # ----------------------------------------------------------------------------
 
-def materialise(template: dict, source: str = SOURCE_HTTP) -> None:
+def _referenced_nodes(template: dict) -> list[tuple[str, str]]:
+    """(k8s node name, where the template names it) for every node the
+    template pins pods to or shapes links on."""
+    refs = [(e["k8s_node"], f"node_site_mapping[{i}] (site {e['site_name']!r})")
+            for i, e in enumerate(template.get("node_site_mapping") or [])]
+    for app_name, app in template["apps"].items():
+        placement = app.get("placement")
+        if not isinstance(placement, dict):
+            continue
+        if placement.get("node"):
+            refs.append((placement["node"], f"app {app_name!r}.placement.node"))
+        for j, entry in enumerate(placement.get("nodes") or []):
+            refs.append((entry["node"],
+                         f"app {app_name!r}.placement.nodes[{j}]"))
+    if DEFAULT_NODE:
+        refs.append((DEFAULT_NODE, "the controller's DEFAULT_NODE env"))
+    return refs
+
+
+def check_live_nodes(template: dict, warnings: list[str]) -> None:
+    """Raise ValueError if the template names a node this cluster doesn't
+    have. validate() can't catch it (it never talks to the cluster), and the
+    symptom is otherwise silent: the pods pinned there sit Pending forever
+    and the materialise just times out waiting for them. If the nodes can't
+    be listed, note it in `warnings` and carry on."""
+    refs = _referenced_nodes(template)
+    if not refs:
+        return
+    status, body = k8s.get("/api/v1/nodes")
+    if status != 200:
+        warnings.append(f"could not list cluster nodes (HTTP {status}), so "
+                        "the template's node names were not checked")
+        return
+    live = sorted(n["metadata"]["name"]
+                  for n in json.loads(body).get("items", []))
+    missing = [f"{node!r} ({where})" for node, where in refs
+               if node not in live]
+    if missing:
+        raise ValueError(
+            f"not a node in this cluster: {', '.join(missing)}; the "
+            f"cluster's nodes are: {', '.join(live)}")
+
+
+def materialise(template: dict, source: str = SOURCE_HTTP) -> dict:
     """Create (or update) all Kubernetes resources for the template.
 
     Two phases:
@@ -1006,8 +1125,14 @@ def materialise(template: dict, source: str = SOURCE_HTTP) -> None:
     into the SOURCE_ANNOTATION on every managed ConfigMap so the
     declarative watcher can tell HTTP-managed templates apart from its
     own and never tear those down.
+
+    Returns a report for the caller to show the user: {"warnings": [...],
+    "network_shaping": netem.apply()'s outcome}. Warnings cover what was
+    done only partially — pods that never became Ready, links not shaped.
     """
     validate(template)
+    warnings: list[str] = []
+    check_live_nodes(template, warnings)
     name = template["name"]
     log.info("Materialising template %s (source=%s)", name, source)
     blueprint = _load_blueprint()
@@ -1025,6 +1150,7 @@ def materialise(template: dict, source: str = SOURCE_HTTP) -> None:
     site_to_node = _validate_node_site_mapping(template)
 
     # ─── Phase 1: create resources with empty peers ─────────────────────
+    deployments_by_role: dict[str, set[str]] = {}
     for role_name, role in template["apps"].items():
         # `placement`/`placements` decides where the pods run: one Deployment
         # for the simple cases, or one per node/site when split across
@@ -1049,6 +1175,7 @@ def materialise(template: dict, source: str = SOURCE_HTTP) -> None:
             _apply(doc)
             if doc.get("kind") == "Deployment":
                 applied_deployments.add(doc["metadata"]["name"])
+        deployments_by_role[role_name] = applied_deployments
         # Re-materialising an app whose placement target count changed renames
         # its Deployments (`wt-<t>-<app>` ⇄ `wt-<t>-<app>-<i>`), so the ones
         # under the old names would otherwise keep running pods that the
@@ -1058,7 +1185,8 @@ def materialise(template: dict, source: str = SOURCE_HTTP) -> None:
 
     # ─── Phase 2: resolve peers to pod IPs and patch ConfigMaps ─────────
     log.info("Template %s: waiting for endpoints to populate…", name)
-    peers_by_role, offsets_by_role, effective_sc = _resolve_peer_ips(template)
+    peers_by_role, offsets_by_role, effective_sc = _resolve_peer_ips(
+        template, deployments_by_role, warnings)
     for role_name in template["apps"]:
         peer_ips = peers_by_role[role_name]
         sc = effective_sc.get(role_name) or None
@@ -1093,10 +1221,29 @@ def materialise(template: dict, source: str = SOURCE_HTTP) -> None:
             log.warning("Template %s: peer-IP patch on %s failed: %s",
                         name, cm_name, status)
 
+    # An app with no outbound edges has nowhere to send, so its net formula
+    # generates nothing (its workers report a net target of 0). Say so rather
+    # than let a declared load silently not happen.
+    for role_name, services in compute_peers(template).items():
+        net = template["apps"][role_name]["net"]
+        x_r = resolved_x[role_name]
+        mbps = max(0.0, net["a"] * x_r + net["b"])
+        if not services and mbps > 0:
+            warnings.append(
+                f"app {role_name!r} has no outbound edges, so its net formula "
+                f"({mbps:g} Mbps per pod at x={x_r:g}) generates no traffic; "
+                "its net target reads 0")
+
     # Apply inter-site link shaping (latency + bandwidth) via tc netem on each
     # node's NIC.  Runs after pods are up so the shaping is in effect before
-    # workers start exchanging traffic.  Never raises — shaping is auxiliary.
-    netem.apply(template)
+    # workers start exchanging traffic.  Never raises — shaping is auxiliary —
+    # but a link left unshaped is reported, not just logged.
+    shaping = netem.apply(template)
+    for pair, link in (shaping.get("links") or {}).items():
+        if not link["applied"]:
+            warnings.append(f"network link {pair} is NOT shaped: "
+                            f"{link['reason']}")
+    return {"warnings": warnings, "network_shaping": shaping}
 
 
 def _deep_merge(base: dict, patch: dict) -> dict:
@@ -1149,7 +1296,9 @@ def _expand_dot_keys(obj):
     return result
 
 
-def patch_template(name: str, patch: dict) -> dict | None:
+def patch_template(name: str, patch: dict,
+                   normalise: Callable[[dict], dict] | None = None,
+                   ) -> tuple[dict, dict] | None:
     """Merge `patch` into the existing template `name` and re-materialise.
 
     The merge is deep — see `_deep_merge` — so a patch only needs to
@@ -1163,12 +1312,17 @@ def patch_template(name: str, patch: dict) -> dict | None:
     overwrite it from the labelled-CM content, so callers PATCHing a
     watch-managed template should usually also update the labelled CM.
 
-    Returns the merged template on success, or None if no template
-    named `name` exists.  Raises ValueError if the merged template
+    Returns (merged template, materialise() report) on success, or None
+    if no template named `name` exists.  Raises ValueError if the merged template
     fails validation (including cycle detection), and RuntimeError if a
     Kubernetes API call fails during re-materialisation.  materialise()
     is idempotent, so a partial failure leaves the cluster in a
     well-defined state that a retry can recover.
+
+    `normalise`, when given, is applied to the merged template before
+    validation and its result is what gets materialised — the HTTP layer
+    passes its POST schema here so a PATCH is checked (and stored) exactly
+    like a POST of the merged template. It raises ValueError to reject.
     """
     info = get_managed(name)
     if info is None or not info.get("template"):
@@ -1181,11 +1335,13 @@ def patch_template(name: str, patch: dict) -> dict | None:
     sanitized = {k: v for k, v in expanded.items() if k != "name"}
     merged = _deep_merge(existing, sanitized)
     merged["name"] = name
+    if normalise is not None:
+        merged = normalise(merged)
     validate(merged)
     log.info("Patching template %s (source=%s) with: %s", name, source,
              json.dumps(sanitized, separators=(",", ":")))
-    materialise(merged, source=source)
-    return merged
+    report = materialise(merged, source=source)
+    return merged, report
 
 
 # ----------------------------------------------------------------------------

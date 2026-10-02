@@ -53,6 +53,17 @@ ACTUAL_NET = Gauge("worker_actual_net_mbps",
 
 INPUT_X = Gauge("worker_input_x", "Current network input value x")
 
+CONFIG_OK = Gauge("worker_config_ok",
+                  "1 if the most recent config from the mounted ConfigMap was "
+                  "applied; 0 if it was rejected (malformed, or configure() "
+                  "raised) — the pod then keeps running its last good config, "
+                  "and the reason is in the worker log.")
+
+
+def config_rejected(reason: str) -> None:
+    """watcher on_error hook: the latest config was not applied."""
+    CONFIG_OK.set(0)
+
 STRESS_CPU = Gauge("worker_cpu_stress_millicores",
                    "CPU the feedback loop currently asks stress-ng to generate "
                    "(millicores). The pod total is this plus the iperf3+python "
