@@ -1221,6 +1221,19 @@ def materialise(template: dict, source: str = SOURCE_HTTP) -> dict:
             log.warning("Template %s: peer-IP patch on %s failed: %s",
                         name, cm_name, status)
 
+    # An app with no outbound edges has nowhere to send, so its net formula
+    # generates nothing (its workers report a net target of 0). Say so rather
+    # than let a declared load silently not happen.
+    for role_name, services in compute_peers(template).items():
+        net = template["apps"][role_name]["net"]
+        x_r = resolved_x[role_name]
+        mbps = max(0.0, net["a"] * x_r + net["b"])
+        if not services and mbps > 0:
+            warnings.append(
+                f"app {role_name!r} has no outbound edges, so its net formula "
+                f"({mbps:g} Mbps per pod at x={x_r:g}) generates no traffic; "
+                "its net target reads 0")
+
     # Apply inter-site link shaping (latency + bandwidth) via tc netem on each
     # node's NIC.  Runs after pods are up so the shaping is in effect before
     # workers start exchanging traffic.  Never raises — shaping is auxiliary —

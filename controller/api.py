@@ -41,7 +41,28 @@ _GAUGE_MAP = {
     "worker_actual_ram_mb": "actual_ram_mb",
     "worker_target_net_mbps": "target_net_mbps",
     "worker_actual_net_mbps": "actual_net_mbps",
+    "worker_config_ok": "config_ok",
 }
+
+
+def _config_rejected(rec: dict) -> bool:
+    """True if a scraped worker says its latest config was NOT applied (it is
+    still running the previous one). Workers predating the gauge don't export
+    it and count as fine."""
+    return rec.get("worker_config_ok") == 0
+
+
+def _config_errors(pods: dict[str, dict]) -> list[str]:
+    """Ready pods (from _list_pods) whose latest config was rejected. Scrapes
+    each one — a few ms per pod — because the pod stays Ready and keeps its
+    old targets, so nothing in k8s state shows it."""
+    bad = []
+    for pod, pd in pods.items():
+        if pd["ready"] and pd.get("ip"):
+            rec = graph._scrape_pod(pd["ip"])
+            if rec is not None and _config_rejected(rec):
+                bad.append(pod)
+    return sorted(bad)
 
 
 # Timezone for the human-facing side of /measurements/range: naive request
@@ -158,6 +179,9 @@ def overview() -> dict:
             "source": info.get("source"),
             "roles": roles_summary,
             "pods": {"total": total, "ready": ready_total},
+            # Ready pods still running a previous config because their latest
+            # one was rejected — healthy to k8s, wrong to the experiment.
+            "config_errors": _config_errors(pods),
         })
     return {
         "site": site_block(),
@@ -250,6 +274,10 @@ def template_status(name: str) -> dict | None:
                 "net_mbps": _sum("worker_actual_net_mbps"),
             },
             "pods": pods_out,
+            # Pods whose latest config was rejected, so their targets above
+            # are a previous config's (see the worker log for why).
+            "config_errors": sorted(rec["pod"] for rec in scrapes
+                                    if _config_rejected(rec)),
         }
 
     return {

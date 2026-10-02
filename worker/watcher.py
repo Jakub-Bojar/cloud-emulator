@@ -32,6 +32,9 @@ from watchdog.observers import Observer
 log = logging.getLogger(__name__)
 
 ConfigCallback = Callable[[dict], None]
+# Told why a config on disk was not applied (unparseable, or the callback
+# raised), so the worker can export it instead of only logging it.
+ErrorCallback = Callable[[str], None]
 
 
 def _validate(payload: dict) -> None:
@@ -49,7 +52,8 @@ def _validate(payload: dict) -> None:
         raise ValueError("peers must be a list of strings if present")
 
 
-def _load_and_apply(path: str, callback: ConfigCallback) -> None:
+def _load_and_apply(path: str, callback: ConfigCallback,
+                    on_error: ErrorCallback | None = None) -> None:
     try:
         with open(path, "rb") as f:
             raw = f.read()
@@ -64,19 +68,25 @@ def _load_and_apply(path: str, callback: ConfigCallback) -> None:
         _validate(payload)
     except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
         log.error("Bad config in %s: %s", path, e)
+        if on_error:
+            on_error(f"bad config: {e}")
         return
     try:
         callback(payload)
-    except Exception:
+    except Exception as e:
         log.exception("configure callback failed")
+        if on_error:
+            on_error(f"configure failed: {e!r}")
 
 
 class ConfigWatcher(FileSystemEventHandler):
-    def __init__(self, path: str, callback: ConfigCallback):
+    def __init__(self, path: str, callback: ConfigCallback,
+                 on_error: ErrorCallback | None = None):
         # Keep the symlink path so each open() follows the current ..data
         # target (NOT realpath() — that would freeze us to a deleted dir).
         self.path = path
         self.callback = callback
+        self.on_error = on_error
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
 
@@ -102,7 +112,7 @@ class ConfigWatcher(FileSystemEventHandler):
     def _do_reload(self) -> None:
         with self._lock:
             self._timer = None
-        _load_and_apply(self.path, self.callback)
+        _load_and_apply(self.path, self.callback, self.on_error)
 
     def on_any_event(self, event) -> None:
         # Any event in the watch directory could be the ..data symlink swap
@@ -112,11 +122,12 @@ class ConfigWatcher(FileSystemEventHandler):
         self._maybe_reload()
 
 
-def start_config_watcher(path: str, callback: ConfigCallback) -> Observer:
+def start_config_watcher(path: str, callback: ConfigCallback,
+                         on_error: ErrorCallback | None = None) -> Observer:
     import os
     watch_dir = os.path.dirname(path) or "."
     os.makedirs(watch_dir, exist_ok=True)
-    handler = ConfigWatcher(path, callback)
+    handler = ConfigWatcher(path, callback, on_error)
     observer = Observer()
     observer.schedule(handler, watch_dir, recursive=False)
     observer.daemon = True
@@ -125,7 +136,8 @@ def start_config_watcher(path: str, callback: ConfigCallback) -> Observer:
     return observer
 
 
-def load_initial(path: str, callback: ConfigCallback) -> None:
+def load_initial(path: str, callback: ConfigCallback,
+                 on_error: ErrorCallback | None = None) -> None:
     """Apply whatever config is on disk right now — used at pod startup
     since the ConfigMap is already mounted before the container starts."""
-    _load_and_apply(path, callback)
+    _load_and_apply(path, callback, on_error)

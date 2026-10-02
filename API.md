@@ -377,13 +377,18 @@ curl http://192.168.2.2:30081/overview | python3 -m json.tool
   "templates": [
     {"name": "<name>", "source": "http",
      "roles": {"<app>": {"desired": 2, "ready": 2}},
-     "pods": {"total": 3, "ready": 3}}
+     "pods": {"total": 3, "ready": 3},
+     "config_errors": []}
   ],
   "prometheus": {"available": true, "url": "http://…:9090"},
   "network_shaping": {"status": "applied",
                       "links": {"site-A ↔ site-B": {"applied": true}}}
 }
 ```
+
+`config_errors` lists Ready pods whose latest config was rejected (they keep
+running the previous one, so k8s still reports them healthy) — read from each
+worker's `worker_config_ok` gauge.
 
 `network_shaping` is the outcome of the most recent materialise (`status`
 `none` when the template declares no links, `unknown` until the first
@@ -420,13 +425,19 @@ curl http://192.168.2.2:30081/measurements/now | python3 -m json.tool
       "pods": [{"name": "wt-<name>-<app>-abc123", "ip": "10.1.0.42",
                 "node": "node-1", "phase": "Running", "ready": true,
                 "restarts": 0, "age_seconds": 312,
-                "metrics": {"x": 10.0, "target_cpu_millicores": 50.0, "...": "..."}}]
+                "metrics": {"x": 10.0, "target_cpu_millicores": 50.0,
+                            "config_ok": 1.0, "...": "..."}}],
+      "config_errors": []   // pods still on a previous config (theirs was rejected)
     }
   },
   "edges": [{"from": "<app-a>", "to": "<app-b>", "mbps": 3.912}],
   "prometheus": {"available": null}
 }
 ```
+
+`config_errors` names pods whose latest config was rejected: their targets are
+a previous config's until a good one arrives. `prometheus.available` is always
+`null` here — this endpoint doesn't query Prometheus.
 
 `404` if nothing is materialised.
 
@@ -644,7 +655,8 @@ Prometheus text-format scrape endpoint. Gauges exposed:
 | Metric | Meaning |
 |--------|---------|
 | `worker_input_x` | Resolved x for this app |
-| `worker_target_cpu_millicores` / `_ram_mb` / `_net_mbps` | `a * x + b` per resource |
+| `worker_target_cpu_millicores` / `_ram_mb` / `_net_mbps` | `a * x + b` per resource — except net is `0` for an app with no outbound edges, which has nowhere to send |
+| `worker_config_ok` | `1` if the latest config from the ConfigMap was applied, `0` if it was rejected (malformed, or applying it failed) — the pod then keeps running its last good config; the worker log says why |
 | `worker_actual_cpu_millicores` | 15s rolling average from cgroup `cpu.stat` |
 | `worker_actual_ram_mb` | cgroup working set (matches cAdvisor / Grafana) |
 | `worker_actual_net_mbps` | 15s rolling egress rate from `psutil.net_io_counters` |

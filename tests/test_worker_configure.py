@@ -66,11 +66,68 @@ class ConfigureTest(unittest.TestCase):
             worker.configure(bad)
         self.assertEqual(self.loads.mock_calls, [])
 
+    def test_rejected_config_leaves_config_ok_at_its_last_value(self):
+        worker.configure(GOOD)
+        self.assertEqual(worker.metrics.CONFIG_OK._value.get(), 1)
+        worker.metrics.config_rejected("bad config: x")
+        self.assertEqual(worker.metrics.CONFIG_OK._value.get(), 0)
+        worker.configure(GOOD)
+        self.assertEqual(worker.metrics.CONFIG_OK._value.get(), 1)
+
+    def test_sink_reports_a_net_target_of_zero(self):
+        worker.configure({**GOOD, "peers": []})
+        self.assertEqual(worker.metrics.TARGET_NET._value.get(), 0)
+        # Its CPU/RAM targets are unaffected.
+        self.assertEqual(worker.metrics.TARGET_CPU._value.get(), 66.0)
+
+    def test_sender_reports_its_net_formula(self):
+        worker.configure(GOOD)
+        self.assertAlmostEqual(worker.metrics.TARGET_NET._value.get(), 1.32)
+
     def test_valid_payload_stops_then_starts_the_new_load(self):
         worker.configure(GOOD)
         self.assertEqual([c[0] for c in self.loads.mock_calls],
                          ["stop_current", "start_network", "start_cpu"])
         self.assertEqual(self.loads.start_cpu.call_args.args[0], 66.0)
+
+
+class WatcherErrorHookTest(unittest.TestCase):
+    """Every way a config on disk can fail to apply reaches on_error, so the
+    worker can export it (worker_config_ok) instead of only logging it."""
+
+    def load(self, content: str, callback) -> list[str]:
+        import tempfile
+        errors: list[str] = []
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            f.write(content)
+            f.flush()
+            worker.watcher._load_and_apply(f.name, callback, errors.append)
+        return errors
+
+    def test_unparseable_config(self):
+        errors = self.load("{not json", mock.Mock())
+        self.assertEqual(len(errors), 1)
+        self.assertTrue(errors[0].startswith("bad config"))
+
+    def test_config_missing_a_field(self):
+        errors = self.load('{"x": 1, "cpu": {"a": 1, "b": 1}}', mock.Mock())
+        self.assertEqual(len(errors), 1)
+
+    def test_callback_raising(self):
+        errors = self.load(
+            '{"x": 1, "cpu": {"a": "fast", "b": 1}, "ram": {"a": 1, "b": 1},'
+            ' "net": {"a": 0, "b": 0}}',
+            mock.Mock(side_effect=ValueError("could not convert")))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("could not convert", errors[0])
+
+    def test_applied_config_is_not_an_error(self):
+        callback = mock.Mock()
+        errors = self.load('{"x": 1, "cpu": {"a": 1, "b": 1}, '
+                           '"ram": {"a": 1, "b": 1}, "net": {"a": 0, "b": 0}}',
+                           callback)
+        self.assertEqual(errors, [])
+        callback.assert_called_once()
 
 
 if __name__ == "__main__":

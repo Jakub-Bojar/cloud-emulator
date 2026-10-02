@@ -41,6 +41,9 @@ BLUEPRINT = REPO_ROOT / "manifests" / "worker-template.yaml"
 
 AXES = {"cpu": {"a": 5, "b": 50}, "ram": {"a": 1, "b": 64},
         "net": {"a": 0.1, "b": 1}}
+# An end-of-graph app sends nothing, so it declares no network load (one that
+# does gets a warning — see SinkNetWarningTest).
+SINK = {**AXES, "net": {"a": 0, "b": 0}}
 MAPPING = [{"k8s_node": "microk8s-vm", "site_name": "site-A"},
            {"k8s_node": "site-b", "site_name": "site-B"},
            {"k8s_node": "site-c", "site_name": "site-C"}]
@@ -54,7 +57,7 @@ A_B = "site-A ↔ site-B"
 
 def template(mapping=MAPPING, links=None, edges=None, **apps) -> dict:
     t = {"name": "report-test", "x": 10, "node_site_mapping": mapping,
-         "apps": apps or {"store": {**AXES, "placements": [
+         "apps": apps or {"store": {**SINK, "placements": [
              {"site": "site-B", "count": 1}]}}}
     if links is not None:
         t["network_links"] = links
@@ -143,7 +146,7 @@ class EndpointTimeoutWarningTest(ControllerTestCase):
         body = template(edges=[{"from": "gateway", "to": "store"}],
                         gateway={**AXES, "placements": [
                             {"site": "site-B", "count": 1}]},
-                        store={**AXES, "placements": [
+                        store={**SINK, "placements": [
                             {"site": "site-C", "count": 2}]})
         report = materialiser.materialise(body)
         self.assertEqual(len(report["warnings"]), 2, report["warnings"])
@@ -151,6 +154,52 @@ class EndpointTimeoutWarningTest(ControllerTestCase):
                       report["warnings"][0])
         self.assertIn("wt-report-test-store: 0 of 2 pods Ready",
                       report["warnings"][1])
+
+
+# ── a declared network load with nowhere to go ─────────────────────────────
+
+class SinkNetWarningTest(ControllerTestCase):
+    def setUp(self):
+        super().setUp()
+        self._patch(mock.patch.object(netem, "apply", lambda t: NO_LINKS))
+
+    def test_sink_with_a_net_formula_is_warned_about(self):
+        report = materialiser.materialise(template(store={
+            **AXES, "placements": [{"site": "site-B", "count": 1}]}))
+        self.assertEqual(report["warnings"], [
+            "app 'store' has no outbound edges, so its net formula (2 Mbps "
+            "per pod at x=10) generates no traffic; its net target reads 0"])
+
+    def test_sink_without_one_and_senders_are_not(self):
+        self.cluster.set_endpoints("wt-report-test-gateway",
+                                   [("wt-report-test-gateway-abc-1", "10.0.0.1")])
+        self.cluster.set_endpoints("wt-report-test-store",
+                                   [("wt-report-test-store-abc-1", "10.0.0.2")])
+        self._patch(mock.patch.object(materialiser, "_rollout_complete",
+                                      lambda d: True))
+        report = materialiser.materialise(template(
+            edges=[{"from": "gateway", "to": "store"}],
+            gateway={**AXES, "placements": [{"site": "site-B", "count": 1}]},
+            store={**SINK, "placements": [{"site": "site-C", "count": 1}]}))
+        self.assertEqual(report["warnings"], [])
+
+
+# ── pods whose latest config was rejected ─────────────────────────────────────
+
+class ConfigErrorsTest(unittest.TestCase):
+    PODS = {"wt-t-store-abc-1": {"ready": True, "ip": "10.0.0.1"},
+            "wt-t-store-abc-2": {"ready": True, "ip": "10.0.0.2"},
+            "wt-t-store-abc-3": {"ready": True, "ip": "10.0.0.3"},
+            "wt-t-store-abc-4": {"ready": False, "ip": None}}
+    SCRAPES = {"10.0.0.1": {"worker_config_ok": 1.0},
+               "10.0.0.2": {"worker_config_ok": 0.0},
+               "10.0.0.3": {}}             # an older worker: no gauge
+
+    def test_only_pods_reporting_a_rejected_config_are_listed(self):
+        with mock.patch.object(controller_app.api.graph, "_scrape_pod",
+                               self.SCRAPES.get):
+            self.assertEqual(controller_app.api._config_errors(self.PODS),
+                             ["wt-t-store-abc-2"])
 
 
 # ── link shaping outcome ──────────────────────────────────────────────────────

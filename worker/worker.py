@@ -89,11 +89,18 @@ def configure(payload: dict) -> None:
 
     if cpu_millicores == 0 and ram_mb == 0 and net_mbps == 0 and not server_count:
         log.info("Configured zero load — staying stopped")
+        metrics.CONFIG_OK.set(1)
         return
+
+    # With no peers (no outbound edges) there is nowhere to send: the net
+    # formula generates no traffic, so the target is 0, not a figure the pod
+    # can never meet — that would drag down role and template net totals.
+    # The formula itself stays visible under /status `formulas`.
+    net_target = net_mbps if peers else 0.0
 
     mode_str = f"peers={peers}" if peers else "peers=[] (server-only)"
     log.info("Configuring x=%.2f → CPU=%.0fm, RAM=%.1fMB, NET=%.2fMbps %s",
-             x, cpu_millicores, ram_mb, net_mbps, mode_str)
+             x, cpu_millicores, ram_mb, net_target, mode_str)
 
     if port_offset_by_pod:
         log.info("Port offset for this pod (%s): %d", POD_NAME, my_port_offset)
@@ -117,7 +124,7 @@ def configure(payload: dict) -> None:
             "x": x,
             "cpu_millicores": cpu_millicores,
             "ram_mb": ram_mb,
-            "net_mbps": net_mbps,
+            "net_mbps": net_target,
             "formulas": {
                 "cpu": {"a": cpu_a, "b": cpu_b},
                 "ram": {"a": ram_a, "b": ram_b},
@@ -128,8 +135,9 @@ def configure(payload: dict) -> None:
 
     metrics.TARGET_CPU.set(cpu_millicores)
     metrics.TARGET_RAM.set(ram_mb)
-    metrics.TARGET_NET.set(net_mbps)
+    metrics.TARGET_NET.set(net_target)
     metrics.INPUT_X.set(x)
+    metrics.CONFIG_OK.set(1)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -164,10 +172,12 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     port = int(os.environ.get("WORKER_PORT", "8080"))
     threading.Thread(target=metrics.sampler_loop, daemon=True).start()
-    watcher.start_config_watcher(CONFIG_PATH, configure)
+    watcher.start_config_watcher(CONFIG_PATH, configure,
+                                 on_error=metrics.config_rejected)
     # Apply whatever config is already on disk at startup (the mounted
     # ConfigMap is present before the container starts).
-    watcher.load_initial(CONFIG_PATH, configure)
+    watcher.load_initial(CONFIG_PATH, configure,
+                         on_error=metrics.config_rejected)
     server = HTTPServer(("0.0.0.0", port), Handler)
     log.info("Worker listening on 0.0.0.0:%d", port)
     server.serve_forever()
