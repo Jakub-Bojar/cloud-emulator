@@ -29,7 +29,7 @@ import app as controller_app  # noqa: E402
 import k8s  # noqa: E402
 import materialiser  # noqa: E402
 
-from fake_k8s import NAMESPACE, FakeCluster  # noqa: E402
+from fake_k8s import NAMESPACE, NO_LINKS, FakeCluster  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 BLUEPRINT = REPO_ROOT / "manifests" / "worker-template.yaml"
@@ -58,7 +58,8 @@ class PatchValidationTest(unittest.TestCase):
                 mock.patch.object(k8s, "namespace", lambda: NAMESPACE),
                 mock.patch.object(materialiser, "BLUEPRINT_PATH", str(BLUEPRINT)),
                 mock.patch.object(materialiser, "DEFAULT_NODE", ""),
-                mock.patch.object(materialiser.netem, "apply", lambda t: None),
+                mock.patch.object(materialiser.netem, "apply",
+                                      lambda tmpl: NO_LINKS),
                 mock.patch.object(materialiser.netem, "teardown",
                                   lambda *a, **kw: None)):
             patcher.start()

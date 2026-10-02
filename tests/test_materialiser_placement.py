@@ -30,7 +30,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "controller
 import materialiser  # noqa: E402
 import k8s  # noqa: E402
 
-from fake_k8s import NAMESPACE, FakeCluster  # noqa: E402
+from fake_k8s import NAMESPACE, NO_LINKS, FakeCluster  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 BLUEPRINT = REPO_ROOT / "manifests" / "worker-template.yaml"
@@ -92,7 +92,7 @@ class PlacementChangeTest(unittest.TestCase):
         # Link shaping runs `multipass exec` against real nodes and is
         # documented as auxiliary; irrelevant to the Deployment set.
         self._patch(mock.patch.object(materialiser.netem, "apply",
-                                      lambda tmpl: None))
+                                      lambda tmpl: NO_LINKS))
 
     def _patch(self, patcher):
         patcher.start()

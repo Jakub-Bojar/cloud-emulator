@@ -24,12 +24,18 @@ Multipass VM name).  If multipass is unavailable (e.g. controller running
 inside a cloud cluster) shaping is skipped and a warning is logged.
 
 Never raises — shaping is auxiliary to materialising the template itself.
+But it does report: apply() returns which links are actually in effect and
+why the others aren't, keeps that as last_result() for /overview, and sets
+emulator_link_shaping_applied{pair} so dashboards don't take the configured
+figures for what the network is doing.
 """
 
 import json
 import logging
 import os
 import subprocess
+
+from prometheus_client import Gauge
 
 import k8s
 import linkspec
@@ -39,6 +45,49 @@ log = logging.getLogger(__name__)
 MULTIPASS      = os.environ.get("MULTIPASS_BIN", "multipass")
 UNSHAPED_RATE  = "10gbit"
 EXEC_TIMEOUT_S = 30
+
+LINK_APPLIED = Gauge(
+    "emulator_link_shaping_applied",
+    "1 if the template's network_link for this pair is shaped with tc as of "
+    "the last materialise, 0 if shaping was skipped or failed. Read "
+    "emulator_configured_* as intent only where this is 0.",
+    ["pair"])
+
+# Outcome of the most recent apply()/teardown(), for GET /overview. Not
+# persisted: after a controller restart nothing is known until the next
+# materialise re-applies the links.
+_UNKNOWN = {"status": "unknown",
+            "detail": "no materialise since the controller started"}
+_last_result: dict = dict(_UNKNOWN)
+
+
+def last_result() -> dict:
+    return dict(_last_result)
+
+
+def _record(links: dict[str, str | None]) -> dict:
+    """Summarise per-link outcomes ({pair: None if applied, else the
+    reason}), publish them on LINK_APPLIED, and remember them."""
+    global _last_result
+    LINK_APPLIED.clear()
+    for pair, reason in links.items():
+        LINK_APPLIED.labels(pair=pair).set(0 if reason else 1)
+    applied = sum(1 for r in links.values() if r is None)
+    if not links:
+        status = "none"
+    elif applied == len(links):
+        status = "applied"
+    elif applied:
+        status = "partial"
+    else:
+        status = "not_applied"
+    _last_result = {
+        "status": status,
+        "links": {pair: ({"applied": True} if reason is None
+                         else {"applied": False, "reason": reason})
+                  for pair, reason in links.items()},
+    }
+    return last_result()
 
 
 # ── Node discovery ─────────────────────────────────────────────────────────────
@@ -138,64 +187,81 @@ def _shape_script(node_ip: str,
     return "\n".join(lines)
 
 
-def _run_script(node_name: str, script: str) -> bool:
-    """Run script on node_name via multipass. Returns True on success."""
+def _run_script(node_name: str, script: str) -> str | None:
+    """Run script on node_name via multipass. Returns None on success, else
+    why it failed."""
     try:
         r = _vm_sh(node_name, script)
     except FileNotFoundError:
         log.warning("netem: multipass not found — install it or set "
                     "MULTIPASS_BIN; skipping link shaping")
-        return False
+        return (f"{MULTIPASS!r} not found where the controller runs, so tc "
+                "can't reach the nodes (see RUNBOOK 'Known limitations')")
     except (subprocess.SubprocessError, OSError) as exc:
         log.warning("netem: exec on %s failed: %s", node_name, exc)
-        return False
+        return f"exec on node {node_name!r} failed: {exc}"
     if r.returncode != 0:
+        err = (r.stderr or "").strip()[:300]
         log.warning("netem: tc on %s failed (rc=%s): %s",
-                    node_name, r.returncode, (r.stderr or "").strip()[:300])
-        return False
-    return True
+                    node_name, r.returncode, err)
+        return f"tc on node {node_name!r} failed (rc={r.returncode}): {err}"
+    return None
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def apply(template: dict) -> None:
+def apply(template: dict) -> dict:
     """Reconcile inter-site link shaping from the template's network_links.
-    Never raises."""
+
+    Never raises. Returns {"status", "links"}: status is "none" (no links
+    declared), "applied", "partial" or "not_applied"; links maps each pair
+    label to {"applied": bool, "reason"?: str}."""
     try:
-        _apply(template)
-    except Exception:
+        return _record(_apply(template))
+    except Exception as exc:
         log.exception("netem: apply failed; continuing without link shaping")
+        try:
+            pairs = [l["pair"] for l in
+                     linkspec.parse_network_links(template.get("network_links"))]
+        except ValueError:
+            pairs = []
+        return _record({p: f"shaping raised {type(exc).__name__}: {exc}"
+                        for p in pairs})
 
 
-def _apply(template: dict) -> None:
+def _apply(template: dict) -> dict[str, str | None]:
+    """Shape every declared link; returns {pair: None | reason skipped}."""
     links = linkspec.parse_network_links(template.get("network_links"))
     nodes = _resolve_sites(template.get("node_site_mapping"))
     if not nodes:
-        return
+        reason = ("template has no node_site_mapping"
+                  if not template.get("node_site_mapping")
+                  else "none of the node_site_mapping nodes could be resolved")
+        return {link["pair"]: reason for link in links}
 
     if not links:
         # No links declared — clear any rules left from a previous template.
         _teardown_nodes(nodes)
-        return
+        return {}
 
     # Collect per-node peer specs so each node gets ONE comprehensive tc script
     # covering all its links (the htb root can only be added once per NIC).
     # peers_for[node_name] = [(peer_ip, one_way_ms, bw_mbps_or_None), ...]
     peers_for: dict[str, list[tuple[str, float, float | None]]] = {}
     node_ip_by_name: dict[str, str] = {name: ip for (name, ip) in nodes.values()}
+    outcome: dict[str, str | None] = {}
+    nodes_of: dict[str, tuple[str, str]] = {}
 
     for link in links:
         from_node = nodes.get(link["from"])
         to_node   = nodes.get(link["to"])
-        if not from_node:
+        missing = link["from"] if not from_node else (
+            link["to"] if not to_node else None)
+        if missing:
             log.warning("netem: site %r has no live node (see "
                         "node_site_mapping); skipping link %s→%s",
-                        link["from"], link["from"], link["to"])
-            continue
-        if not to_node:
-            log.warning("netem: site %r has no live node (see "
-                        "node_site_mapping); skipping link %s→%s",
-                        link["to"], link["from"], link["to"])
+                        missing, link["from"], link["to"])
+            outcome[link["pair"]] = f"site {missing!r} has no live node"
             continue
         from_name, from_ip = from_node
         to_name,   to_ip   = to_node
@@ -203,13 +269,22 @@ def _apply(template: dict) -> None:
         bw_mbps  = link.get("bandwidth_mbps")
         peers_for.setdefault(from_name, []).append((to_ip,   delay_ms, bw_mbps))
         peers_for.setdefault(to_name,   []).append((from_ip, delay_ms, bw_mbps))
+        nodes_of[link["pair"]] = (from_name, to_name)
 
+    # A link is in effect only if the scripts on both of its ends succeeded.
+    failed: dict[str, str] = {}
     for node_name, peers in peers_for.items():
         node_ip = node_ip_by_name[node_name]
         script  = _shape_script(node_ip, peers)
-        if _run_script(node_name, script):
+        err = _run_script(node_name, script)
+        if err is None:
             log.info("netem: shaped %s — %d link(s) (%.1f ms one-way on first)",
                      node_name, len(peers), peers[0][1])
+        else:
+            failed[node_name] = err
+    for pair, ends in nodes_of.items():
+        outcome[pair] = next((failed[n] for n in ends if n in failed), None)
+    return outcome
 
 
 def teardown(node_site_mapping=None) -> None:
@@ -225,9 +300,10 @@ def teardown(node_site_mapping=None) -> None:
             _teardown_nodes(nodes)
     except Exception:
         log.exception("netem: teardown failed; continuing")
+    _record({})
 
 
 def _teardown_nodes(nodes: dict[str, tuple[str, str]]) -> None:
     for site, (node_name, node_ip) in nodes.items():
-        if _run_script(node_name, _clear_script(node_ip)):
+        if _run_script(node_name, _clear_script(node_ip)) is None:
             log.info("netem: cleared shaping on %s (site=%s)", node_name, site)

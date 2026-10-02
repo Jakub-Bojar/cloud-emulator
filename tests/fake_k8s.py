@@ -14,7 +14,8 @@ Deliberate simplifications, none of which the materialiser depends on:
     patchMergeKey semantics real strategic-merge uses for lists such as
     `containers`. The materialiser only relies on scalar and map fields
     (`spec.replicas`, `spec.template.spec.nodeSelector`) surviving a patch.
-    - No resourceVersion, no admission, no defaulting, no controllers — a
+    - Nodes are a fixed list of names (`nodes`), served at /api/v1/nodes.
+  - No resourceVersion, no admission, no defaulting, no controllers — a
     Deployment never produces Pods or status on its own. A test plays the
     controllers' part with set_endpoints() and roll_out(); a Service with
     no Endpoints set 404s, as it would before its first Ready pod. The one
@@ -28,6 +29,10 @@ import json
 import urllib.parse
 
 NAMESPACE = "emulator"
+
+# What netem.apply() reports for a template without network_links; tests that
+# stub shaping out return this.
+NO_LINKS = {"status": "none", "links": {}}
 
 # API path segment → the `kind` its list response reports.
 _LIST_KIND = {
@@ -66,6 +71,9 @@ class FakeCluster:
         self.objects: dict[str, dict[str, dict]] = {
             "deployments": {}, "services": {}, "configmaps": {},
             "endpoints": {}}
+        # Cluster-scoped: the nodes GET /api/v1/nodes lists. Defaults to the
+        # three-node cluster the tests' templates name; None makes it 403.
+        self.nodes: list[str] | None = ["microk8s-vm", "site-b", "site-c"]
         # Every (method, collection, name) tuple the code under test issued,
         # so a test can assert on what was *not* touched as well as what was.
         self.calls: list[tuple[str, str, str | None]] = []
@@ -115,7 +123,13 @@ class FakeCluster:
                 timeout: float = 10.0) -> tuple[int, bytes]:
         parsed = urllib.parse.urlparse(path)
         segments = parsed.path.strip("/").split("/")
-        # Every path the materialiser builds is namespaced:
+        if segments == ["api", "v1", "nodes"] and method == "GET":
+            self.calls.append((method, "nodes", None))
+            if self.nodes is None:      # e.g. RBAC lost the ClusterRole
+                return 403, self._status("nodes is forbidden")
+            return 200, json.dumps({"kind": "NodeList", "items": [
+                {"metadata": {"name": n}} for n in self.nodes]}).encode()
+        # Every other path the materialiser builds is namespaced:
         #   .../namespaces/<ns>/<collection>[/<name>]
         idx = segments.index("namespaces")
         collection = segments[idx + 2]
