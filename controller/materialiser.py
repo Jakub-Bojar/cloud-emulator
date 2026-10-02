@@ -17,8 +17,10 @@ up to the controller's HTTP handler.
 import copy
 import json
 import logging
+import math
 import os
 import time
+from typing import Callable
 
 import yaml
 
@@ -350,6 +352,15 @@ def validate(template: dict) -> None:
             sub = role.get(axis)
             if not isinstance(sub, dict) or "a" not in sub or "b" not in sub:
                 raise ValueError(f"app {role_name!r}.{axis} must have 'a' and 'b'")
+            # The worker evaluates these as floats; a non-number here would
+            # only fail inside the worker, after the template was accepted.
+            for coef in ("a", "b"):
+                v = sub[coef]
+                if (isinstance(v, bool) or not isinstance(v, (int, float))
+                        or not math.isfinite(v)):
+                    raise ValueError(
+                        f"app {role_name!r}.{axis}.{coef} must be a number, "
+                        f"got {v!r}")
         # `placement` decides where this app's pods actually run — on nodes
         # matching arbitrary labels (`on` [+`spread`]), pinned to one `node`,
         # or split across `nodes` with per-node counts (one Deployment per
@@ -624,15 +635,59 @@ def _get_endpoint_pods(service_name: str) -> list[tuple[str, str]]:
     return result
 
 
+def _owning_deployment(pod_name: str) -> str:
+    """`<deployment>-<pod-template-hash>-<suffix>` → `<deployment>`."""
+    return pod_name.rsplit("-", 2)[0]
+
+
+def _rollout_complete(dep_name: str) -> bool:
+    """True once every pod of Deployment `dep_name` runs its current spec and
+    no pod from an older ReplicaSet is still active (the same test as
+    `kubectl rollout status`). Terminating pods drop out of both these counts
+    and the Service's Endpoints, so after this the Endpoints converge on
+    exactly the Deployment's current pods."""
+    status, body = k8s.get(_kind_path("Deployment", dep_name))
+    if status != 200:
+        return False
+    dep = json.loads(body)
+    want = dep.get("spec", {}).get("replicas", 1)
+    st = dep.get("status") or {}
+    return (st.get("observedGeneration", 0)
+            >= dep.get("metadata", {}).get("generation", 0)
+            and st.get("updatedReplicas", 0) == want
+            and st.get("replicas", 0) == want
+            and st.get("availableReplicas", 0) == want)
+
+
 def _wait_for_endpoint_pods(service_name: str, want_count: int,
+                             deployments: set[str] | None = None,
                              timeout: float = 30.0) -> list[tuple[str, str]]:
-    """Poll until at least `want_count` (pod_name, ip) pairs are Ready."""
+    """Poll until the Service's Ready (pod_name, ip) pairs are the app's.
+
+    Without `deployments`: until at least `want_count` pairs are Ready.
+
+    With `deployments` (the app's current Deployment names): only pods owned
+    by those Deployments count, every one of them must have finished rolling
+    out, and the count must be exactly `want_count`. Right after a
+    re-materialise the Endpoints still list the previous pods — those of a
+    just-pruned Deployment, or an older ReplicaSet mid rolling update — and
+    they stay Ready until they terminate. Accepting them would hand upstream
+    apps IPs that are about to disappear, and nothing re-resolves peers
+    afterwards, so the edge would carry no traffic until the next
+    materialise."""
     deadline = time.monotonic() + timeout
     last: list[tuple[str, str]] = []
     while time.monotonic() < deadline:
         last = _get_endpoint_pods(service_name)
-        if len(last) >= want_count:
-            return last
+        if deployments is None:
+            if len(last) >= want_count:
+                return last
+        else:
+            last = [(pod, ip) for (pod, ip) in last
+                    if _owning_deployment(pod) in deployments]
+            if (len(last) == want_count
+                    and all(_rollout_complete(d) for d in deployments)):
+                return last
         time.sleep(1.0)
     if last:
         log.warning("endpoints for %s: got %d of %d expected within %.0fs",
@@ -645,6 +700,7 @@ def _wait_for_endpoint_pods(service_name: str, want_count: int,
 
 def _resolve_peer_ips(
         template: dict,
+        deployments_by_role: dict[str, set[str]] | None = None,
 ) -> tuple[dict[str, list[str]], dict[str, dict[str, int]], dict[str, int]]:
     """Expand each role's peer Services into bare pod IPs and assign each
     source pod a port offset so it lands on a unique iperf3 server port on
@@ -671,7 +727,12 @@ def _resolve_peer_ips(
         iperf3 server slots each target role needs: (highest offset of any
         pod connecting to it) + 1. May exceed the raw fanin since greedy
         colouring isn't guaranteed minimal, but it never collides.
+
+    `deployments_by_role` names each app's current Deployments (as just
+    applied by materialise). When given, only those Deployments' rolled-out
+    pods are resolved — see _wait_for_endpoint_pods.
     """
+    deps = deployments_by_role or {}
     name = template["name"]
     prefix = f"wt-{name}-"
     intended = compute_peers(template)
@@ -687,14 +748,16 @@ def _resolve_peer_ips(
             continue
         src_count = _effective_count(template["apps"][src_role])
         src_pods_by_role[src_role] = sorted(
-            _wait_for_endpoint_pods(prefix + src_role, src_count),
+            _wait_for_endpoint_pods(prefix + src_role, src_count,
+                                    deps.get(src_role)),
             key=lambda t: t[0])
         for svc in services:
             if svc not in ip_cache:
                 trole = svc[len(prefix):]
                 want = _effective_count(template["apps"][trole])
                 ip_cache[svc] = [ip for (_, ip)
-                                 in _wait_for_endpoint_pods(svc, want)]
+                                 in _wait_for_endpoint_pods(svc, want,
+                                                            deps.get(trole))]
             for ip in ip_cache[svc]:
                 if ip not in resolved[src_role]:
                     resolved[src_role].append(ip)
@@ -1025,6 +1088,7 @@ def materialise(template: dict, source: str = SOURCE_HTTP) -> None:
     site_to_node = _validate_node_site_mapping(template)
 
     # ─── Phase 1: create resources with empty peers ─────────────────────
+    deployments_by_role: dict[str, set[str]] = {}
     for role_name, role in template["apps"].items():
         # `placement`/`placements` decides where the pods run: one Deployment
         # for the simple cases, or one per node/site when split across
@@ -1049,6 +1113,7 @@ def materialise(template: dict, source: str = SOURCE_HTTP) -> None:
             _apply(doc)
             if doc.get("kind") == "Deployment":
                 applied_deployments.add(doc["metadata"]["name"])
+        deployments_by_role[role_name] = applied_deployments
         # Re-materialising an app whose placement target count changed renames
         # its Deployments (`wt-<t>-<app>` ⇄ `wt-<t>-<app>-<i>`), so the ones
         # under the old names would otherwise keep running pods that the
@@ -1058,7 +1123,8 @@ def materialise(template: dict, source: str = SOURCE_HTTP) -> None:
 
     # ─── Phase 2: resolve peers to pod IPs and patch ConfigMaps ─────────
     log.info("Template %s: waiting for endpoints to populate…", name)
-    peers_by_role, offsets_by_role, effective_sc = _resolve_peer_ips(template)
+    peers_by_role, offsets_by_role, effective_sc = _resolve_peer_ips(
+        template, deployments_by_role)
     for role_name in template["apps"]:
         peer_ips = peers_by_role[role_name]
         sc = effective_sc.get(role_name) or None
@@ -1149,7 +1215,9 @@ def _expand_dot_keys(obj):
     return result
 
 
-def patch_template(name: str, patch: dict) -> dict | None:
+def patch_template(name: str, patch: dict,
+                   normalise: Callable[[dict], dict] | None = None,
+                   ) -> dict | None:
     """Merge `patch` into the existing template `name` and re-materialise.
 
     The merge is deep — see `_deep_merge` — so a patch only needs to
@@ -1169,6 +1237,11 @@ def patch_template(name: str, patch: dict) -> dict | None:
     Kubernetes API call fails during re-materialisation.  materialise()
     is idempotent, so a partial failure leaves the cluster in a
     well-defined state that a retry can recover.
+
+    `normalise`, when given, is applied to the merged template before
+    validation and its result is what gets materialised — the HTTP layer
+    passes its POST schema here so a PATCH is checked (and stored) exactly
+    like a POST of the merged template. It raises ValueError to reject.
     """
     info = get_managed(name)
     if info is None or not info.get("template"):
@@ -1181,6 +1254,8 @@ def patch_template(name: str, patch: dict) -> dict | None:
     sanitized = {k: v for k, v in expanded.items() if k != "name"}
     merged = _deep_merge(existing, sanitized)
     merged["name"] = name
+    if normalise is not None:
+        merged = normalise(merged)
     validate(merged)
     log.info("Patching template %s (source=%s) with: %s", name, source,
              json.dumps(sanitized, separators=(",", ":")))

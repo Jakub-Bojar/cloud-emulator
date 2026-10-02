@@ -64,7 +64,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 import api
 import graph
@@ -419,6 +419,23 @@ def create_template(template: Template):
     return _stamp({"name": body["name"], **materialiser.describe(body)})
 
 
+def _normalise_patched(merged: dict) -> dict:
+    """Hold a PATCH-merged template to the same schema as a POST body.
+
+    PATCH bodies are free-form (dot-paths, partial objects), so they can't be
+    modelled up front — but the merged result can. Without this a PATCH could
+    store values POST would reject (e.g. a string coefficient), which reach the
+    workers and break them. Returns the dump POST would have stored."""
+    try:
+        template = Template.model_validate(merged)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
+            for err in exc.errors())
+        raise ValueError(f"patched template is invalid: {problems}") from exc
+    return template.model_dump(by_alias=True, exclude_none=True)
+
+
 @app.patch("/template")
 def patch_template(patch: dict):
     # Body is free-form: supports nested JSON and dot-path shorthand, so it is
@@ -426,7 +443,8 @@ def patch_template(patch: dict):
     patch.pop("timestamp", None)  # injected by GET /template; not content
     with _write_lock:
         name = _single_template_name()
-        merged = materialiser.patch_template(name, patch)
+        merged = materialiser.patch_template(name, patch,
+                                             normalise=_normalise_patched)
     if merged is None:
         raise HTTPException(404, "no template materialised")
     # Re-sync the scenario runner to the merged template: edits to

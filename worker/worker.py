@@ -52,9 +52,11 @@ def configure(payload: dict) -> None:
           "net": {"a": 0.1, "b": 1} }    # Mbps
 
     A payload with x=0 and all-zero coefficients is treated as a stop.
-    """
-    loads.stop_current()
 
+    The whole payload is parsed before the running load is stopped, so a
+    malformed one raises here and leaves the previous configuration running
+    rather than an idle pod still reporting its old targets.
+    """
     x = float(payload["x"])
     cpu_a, cpu_b = float(payload["cpu"]["a"]), float(payload["cpu"]["b"])
     ram_a, ram_b = float(payload["ram"]["a"]), float(payload["ram"]["b"])
@@ -76,6 +78,15 @@ def configure(payload: dict) -> None:
 
     server_count = payload.get("server_count") or 0
 
+    # The controller assigns each source pod a unique port offset so it
+    # connects to a distinct iperf3 server port on every target pod.
+    # This avoids the iperf3 single-session limit when multiple source
+    # pods would otherwise all try the same port simultaneously.
+    port_offset_by_pod: dict = payload.get("port_offset_by_pod") or {}
+    my_port_offset: int = int(port_offset_by_pod.get(POD_NAME, 0))
+
+    loads.stop_current()
+
     if cpu_millicores == 0 and ram_mb == 0 and net_mbps == 0 and not server_count:
         log.info("Configured zero load — staying stopped")
         return
@@ -84,12 +95,6 @@ def configure(payload: dict) -> None:
     log.info("Configuring x=%.2f → CPU=%.0fm, RAM=%.1fMB, NET=%.2fMbps %s",
              x, cpu_millicores, ram_mb, net_mbps, mode_str)
 
-    # The controller assigns each source pod a unique port offset so it
-    # connects to a distinct iperf3 server port on every target pod.
-    # This avoids the iperf3 single-session limit when multiple source
-    # pods would otherwise all try the same port simultaneously.
-    port_offset_by_pod: dict = payload.get("port_offset_by_pod") or {}
-    my_port_offset: int = int(port_offset_by_pod.get(POD_NAME, 0))
     if port_offset_by_pod:
         log.info("Port offset for this pod (%s): %d", POD_NAME, my_port_offset)
     loads.start_network(net_mbps, peers,
